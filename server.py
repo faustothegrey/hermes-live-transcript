@@ -442,6 +442,36 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   }
   .agent-badge .dot.alive { background: #3fb950; }
   .agent-badge .dot.dead { background: #da3633; }
+  #agent-tooltip {
+    display: none;
+    position: fixed;
+    z-index: 999;
+    background: #1c2128;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 15px;
+    font-family: var(--mono);
+    color: #e6edf3;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    cursor: pointer;
+    pointer-events: auto;
+    max-width: 500px;
+    white-space: nowrap;
+    line-height: 1.5;
+  }
+  #agent-tooltip .tt-cmd {
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  #agent-tooltip .tt-hint {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: sans-serif;
+    display: block;
+    margin-top: 4px;
+    text-align: center;
+  }
 </style>
 </head>
 <body>
@@ -454,6 +484,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 <div class="session-info" id="session-info">Loading session...</div>
 
 <div id="agent-bar"><span style="color:var(--muted)">agents:</span></div>
+<div id="agent-tooltip"></div>
 
 <div class="controls">
   <button id="btn-scroll" class="active" onclick="toggleScroll()">Auto-scroll</button>
@@ -597,6 +628,35 @@ function copyTmux(cmd, el) {
   }).catch(() => {});
 }
 
+const tooltipEl = document.getElementById('agent-tooltip');
+let tooltipHideTimer = null;
+
+function showTooltip(cmd, x, y) {
+  if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+  tooltipEl.innerHTML = '<span class="tt-cmd">' + escapeHtml(cmd) + '</span><span class="tt-hint">Click to copy</span>';
+  tooltipEl.style.left = Math.min(x, window.innerWidth - tooltipEl.offsetWidth - 20) + 'px';
+  tooltipEl.style.top = (y + 16) + 'px';
+  tooltipEl.style.display = 'block';
+  tooltipEl.dataset.cmd = cmd;
+}
+
+function hideTooltip(delay) {
+  if (tooltipHideTimer) clearTimeout(tooltipHideTimer);
+  tooltipHideTimer = setTimeout(() => {
+    tooltipEl.style.display = 'none';
+    tooltipHideTimer = null;
+  }, delay || 0);
+}
+
+tooltipEl.addEventListener('mouseenter', () => {
+  if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+});
+tooltipEl.addEventListener('mouseleave', () => hideTooltip(100));
+tooltipEl.addEventListener('click', () => {
+  const cmd = tooltipEl.dataset.cmd;
+  if (cmd) copyTmux(cmd, tooltipEl);
+});
+
 setInterval(poll, 3000);
 poll();
 
@@ -620,16 +680,24 @@ function pollAgentBar() {
         const displayName = a.name === 'agy' ? 'gemini' : a.name;
         const color = agentColors[displayName] || 'var(--text)';
         const label = a.type ? `${displayName} (${a.type})` : displayName;
-        let badge = `<span class="agent-badge" style="color:${color}"`;
+        let badge = `<span class="agent-badge" style="color:${color};cursor:pointer"`;
         if (a.tmux_attach) {
-          badge += ` title="Click to copy: ${a.tmux_attach}"`;
-          badge += ` onclick="copyTmux('${a.tmux_attach}', this)"`;
-          badge += ` style="cursor:pointer;color:${color}"`;
+          badge += ` data-tmux="${a.tmux_attach.replace(/"/g,'&quot;')}"`;
         }
         badge += `><span class="dot ${a.alive ? 'alive' : 'dead'}"></span>${label}</span>`;
         html += badge;
       }
       bar.innerHTML = html;
+
+      // Attach hover events for tooltip badges via delegation
+      bar.querySelectorAll('.agent-badge[data-tmux]').forEach(el => {
+        el.addEventListener('mouseenter', (e) => {
+          const cmd = el.dataset.tmux;
+          const rect = el.getBoundingClientRect();
+          showTooltip(cmd, rect.left, rect.bottom);
+        });
+        el.addEventListener('mouseleave', () => hideTooltip(200));
+      });
     })
     .catch(() => {});
 }
