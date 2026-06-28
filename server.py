@@ -221,24 +221,23 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self._json(200, body)
 
     def _serve_bus_status(self):
-        """Return agent liveness from Agent Bus."""
+        """Return agent liveness from Agent Telemetry (port 9900)."""
         try:
             import urllib.request
-            with urllib.request.urlopen("http://127.0.0.1:9901/bus", timeout=3) as r:
-                bus = json.loads(r.read())
+            with urllib.request.urlopen("http://127.0.0.1:9900/agents", timeout=3) as r:
+                telemetry = json.loads(r.read())
         except Exception:
-            bus = {}
+            telemetry = {}
 
         agents = []
-        for name, data in sorted(bus.items()):
-            if data.get("session"):
-                agents.append({
-                    "name": name,
-                    "type": "gemini" if data.get("type") == "agy" else data.get("type"),
-                    "alive": data.get("alive", False),
-                    "inbox": data.get("inbox_count", 0),
-                    "outbox": data.get("outbox_count", 0),
-                })
+        for name, data in sorted(telemetry.items()):
+            if name in ("agenttest", "smtest"):
+                continue
+            agents.append({
+                "name": name,
+                "type": "gemini" if name == "agy" else name,
+                "alive": bool(data.get("alive", False)),
+            })
 
         body = json.dumps({"agents": agents}).encode("utf-8")
         self._json(200, body)
