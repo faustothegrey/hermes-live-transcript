@@ -72,22 +72,31 @@ def get_messages(session_id: str, after_id: int = 0) -> list[dict]:
         return []
 
 
-def get_bus_messages(limit: int = 30) -> list[dict]:
-    """Return recent agent bus messages, newest first."""
+def get_bus_messages(limit: int = 30, after_id: int = 0) -> list[dict]:
+    """Return recent agent bus messages, newest first. Optionally only after a given id."""
     if not BUS_LOG_DB.exists():
         return []
     try:
         with sqlite3.connect(str(BUS_LOG_DB)) as db:
-            cur = db.execute(
-                """SELECT id, agent, direction, content, msg_type, created_at
-                   FROM bus_messages ORDER BY id DESC LIMIT ?""",
-                (limit,),
-            )
+            if after_id > 0:
+                cur = db.execute(
+                    """SELECT id, agent, direction, content, msg_type, created_at
+                       FROM bus_messages WHERE id > ? ORDER BY id ASC""",
+                    (after_id,),
+                )
+            else:
+                cur = db.execute(
+                    """SELECT id, agent, direction, content, msg_type, created_at
+                       FROM bus_messages ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                )
             rows = cur.fetchall()
         result = []
         for row in rows:
             bus_id = row[0]
             agent = row[1]
+            if agent == "agy":
+                agent = "gemini"
             direction = row[2]
             content = row[3]
             arrow = "→ to" if direction == "to" else "← from"
@@ -99,7 +108,10 @@ def get_bus_messages(limit: int = 30) -> list[dict]:
                 "timestamp": row[5] or 0,
                 "is_bus": True,
             })
-        return result  # newest first
+        # If after_id, return chronological; if initial, return newest-first
+        if after_id == 0:
+            return result  # newest first
+        return result  # chronological
     except Exception:
         return []
 
@@ -126,32 +138,40 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             return
 
         after = 0
+        bus_after = 0
         limit = 60
         query = self.path.split("?")
         if len(query) > 1:
             params = dict(p.split("=") for p in query[1].split("&") if "=" in p)
             after = int(params.get("after", "0"))
+            bus_after = int(params.get("bus_after", "0"))
             limit = int(params.get("limit", "60"))
 
         msgs = get_messages(sid, after_id=after)
 
-        # Merge in agent bus messages only on initial load
+        # Merge bus messages on every poll (incremental via bus_after)
         if after == 0:
             bus_msgs = get_bus_messages(limit)
-            if bus_msgs:
-                bus_msgs.reverse()
-                all_msgs = []
-                ti, bi = 0, 0
-                while ti < len(msgs) and bi < len(bus_msgs):
-                    if msgs[ti]["timestamp"] <= bus_msgs[bi]["timestamp"]:
-                        all_msgs.append(msgs[ti])
-                        ti += 1
-                    else:
-                        all_msgs.append(bus_msgs[bi])
-                        bi += 1
-                all_msgs.extend(msgs[ti:])
-                all_msgs.extend(bus_msgs[bi:])
-                msgs = all_msgs
+        elif bus_after > 0:
+            bus_msgs = get_bus_messages(after_id=bus_after)
+        else:
+            bus_msgs = []
+
+        if bus_msgs:
+            if after == 0:
+                bus_msgs.reverse()  # initial: newest-first → chronological for merge
+            all_msgs = []
+            ti, bi = 0, 0
+            while ti < len(msgs) and bi < len(bus_msgs):
+                if msgs[ti]["timestamp"] <= bus_msgs[bi]["timestamp"]:
+                    all_msgs.append(msgs[ti])
+                    ti += 1
+                else:
+                    all_msgs.append(bus_msgs[bi])
+                    bi += 1
+            all_msgs.extend(msgs[ti:])
+            all_msgs.extend(bus_msgs[bi:])
+            msgs = all_msgs
 
         # Always cap at limit after merge/trim
         if after == 0 and len(msgs) > limit:
@@ -180,6 +200,17 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         if msgs:
             last = msgs[-1]
             data["last_id"] = last.get("id") or last.get("bus_id") or 0
+            # For incremental polling, use the last transcript message id
+            for m in reversed(msgs):
+                tid = m.get("id", 0)
+                if tid and tid > 0:
+                    data["last_transcript_id"] = tid
+                    break
+            # Track the highest bus internal id for bus_after
+            for m in reversed(msgs):
+                if m.get("is_bus") and m.get("bus_id", 0) > 0:
+                    data["last_bus_id"] = m["bus_id"]
+                    break
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self._json(200, body)
 
@@ -203,7 +234,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             if data.get("session"):
                 agents.append({
                     "name": name,
-                    "type": data.get("type"),
+                    "type": "gemini" if data.get("type") == "agy" else data.get("type"),
                     "alive": data.get("alive", False),
                     "inbox": data.get("inbox_count", 0),
                     "outbox": data.get("outbox_count", 0),
@@ -322,6 +353,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   .msg-role.claude { background: var(--claude); color: #0d1117; }
   .msg-role.codex { background: var(--codex); color: #0d1117; }
   .msg-role.gemini { background: var(--gemini); color: #0d1117; }
+  .msg-role.agy { background: var(--gemini); color: #0d1117; }
   .msg-time { color: var(--muted); font-size: 11px; }
   .msg-content {
     white-space: pre-wrap;
@@ -424,6 +456,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 
 <script>
 let lastId = 0;
+let lastBusId = 0;
 let sessionId = null;
 let autoScroll = true;
 let polling = false;
@@ -449,7 +482,7 @@ async function poll() {
     const isInitial = !sessionId || lastId === 0;
     const url = isInitial
       ? '/api/current?limit=' + MAX_VISIBLE
-      : `/api/current?after=${lastId}`;
+      : `/api/current?after=${lastId}&bus_after=${lastBusId}`;
     const r = await fetch(url);
     const data = await r.json();
 
@@ -464,6 +497,7 @@ async function poll() {
     if (data.session_id !== sessionId) {
       sessionId = data.session_id;
       lastId = 0;
+      lastBusId = 0;
       document.getElementById('transcript').innerHTML = '';
       document.getElementById('msg-count').textContent = '0 messages';
       document.getElementById('dot').className = 'dot live';
@@ -481,7 +515,10 @@ async function poll() {
 
     if (data.messages && data.messages.length > 0) {
       appendMessages(data.messages);
-      lastId = data.last_id || data.messages[data.messages.length - 1].id;
+      // Use transcript id for incremental polling (bus ids are negative)
+      if (data.last_transcript_id) lastId = data.last_transcript_id;
+      else if (data.last_id && data.last_id > 0) lastId = data.last_id;
+      if (data.last_bus_id) lastBusId = data.last_bus_id;
       trimTranscript();
     }
   } catch (e) {
@@ -561,8 +598,9 @@ function pollAgentBar() {
       }
       let html = '<span style="color:var(--muted)">agents:</span>';
       for (const a of data.agents) {
-        const color = agentColors[a.name] || 'var(--text)';
-        const label = a.type ? `${a.name} (${a.type})` : a.name;
+        const displayName = a.name === 'agy' ? 'gemini' : a.name;
+        const color = agentColors[displayName] || 'var(--text)';
+        const label = a.type ? `${displayName} (${a.type})` : displayName;
         html += `<span class="agent-badge" style="color:${color}">`
               + `<span class="dot ${a.alive ? 'alive' : 'dead'}"></span>`
               + `${label}</span>`;
