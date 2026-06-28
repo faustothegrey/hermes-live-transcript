@@ -229,15 +229,27 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         except Exception:
             telemetry = {}
 
+        # Read agent sessions for tmux attach info
+        sessions = {}
+        try:
+            with open(Path.home() / ".hermes" / "agent-sessions.json") as f:
+                sessions = json.load(f)
+        except Exception:
+            pass
+
         agents = []
         for name, data in sorted(telemetry.items()):
             if name in ("agenttest", "smtest"):
                 continue
-            agents.append({
+            entry = {
                 "name": name,
                 "type": "gemini" if name == "agy" else name,
                 "alive": bool(data.get("alive", False)),
-            })
+            }
+            session_info = sessions.get(name)
+            if session_info and session_info.get("session"):
+                entry["tmux_attach"] = f"tmux attach -t {session_info['session']}"
+            agents.append(entry)
 
         body = json.dumps({"agents": agents}).encode("utf-8")
         self._json(200, body)
@@ -577,6 +589,14 @@ function clearTranscript() {
   document.getElementById('msg-count').textContent = '0 messages';
 }
 
+function copyTmux(cmd, el) {
+  navigator.clipboard.writeText(cmd).then(() => {
+    el.style.outline = '2px solid #3fb950';
+    el.style.outlineOffset = '2px';
+    setTimeout(() => { el.style.outline = ''; el.style.outlineOffset = ''; }, 1200);
+  }).catch(() => {});
+}
+
 setInterval(poll, 3000);
 poll();
 
@@ -600,9 +620,14 @@ function pollAgentBar() {
         const displayName = a.name === 'agy' ? 'gemini' : a.name;
         const color = agentColors[displayName] || 'var(--text)';
         const label = a.type ? `${displayName} (${a.type})` : displayName;
-        html += `<span class="agent-badge" style="color:${color}">`
-              + `<span class="dot ${a.alive ? 'alive' : 'dead'}"></span>`
-              + `${label}</span>`;
+        let badge = `<span class="agent-badge" style="color:${color}"`;
+        if (a.tmux_attach) {
+          badge += ` title="Click to copy: ${a.tmux_attach}"`;
+          badge += ` onclick="copyTmux('${a.tmux_attach}', this)"`;
+          badge += ` style="cursor:pointer;color:${color}"`;
+        }
+        badge += `><span class="dot ${a.alive ? 'alive' : 'dead'}"></span>${label}</span>`;
+        html += badge;
       }
       bar.innerHTML = html;
     })
