@@ -25,6 +25,7 @@ BUS_LOG_DB = Path.home() / ".hermes" / "agent-bus-log.db"
 # Dev mode: shorter poll, verbose logging
 DEV_MODE = "--dev" in sys.argv
 POLL_INTERVAL = 1000 if DEV_MODE else 3000  # ms
+DEAD_AGENT_HIDE_AFTER_SECONDS = 20 * 60
 
 if DEV_MODE:
     print(f"  ⚠ DEV MODE — poll every {POLL_INTERVAL}ms")
@@ -56,6 +57,26 @@ def safe_int(value: str | None, default: int = 0, minimum: int | None = None) ->
     if minimum is not None and parsed < minimum:
         return minimum
     return parsed
+
+
+def parse_activity_ts(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def should_show_agent(data: dict) -> bool:
+    if data.get("alive", False):
+        return True
+
+    last_activity = parse_activity_ts(data.get("last_activity"))
+    if last_activity is None:
+        return True
+
+    return datetime.now().timestamp() - last_activity <= DEAD_AGENT_HIDE_AFTER_SECONDS
 
 
 def get_current_session_id() -> str | None:
@@ -325,6 +346,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         agents = []
         for name, data in sorted(telemetry.items()):
             if name in ("agenttest", "smtest"):
+                continue
+            if not should_show_agent(data):
                 continue
             entry = {
                 "name": name,
