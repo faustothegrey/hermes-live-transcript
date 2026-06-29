@@ -48,7 +48,7 @@ Utile per:
 | **Log di servizio** | `~/.hermes/logs/live-transcript.log` | stdout/stderr del processo server (vuoto in condizioni normali, errori vanno qui). |
 | **Agent Telemetry** | Porta 9900 — `~/Software/scripts-ai/agent_telemetry.py` | Servizio HTTP che taila i log di Claude Code, Codex, Antigravity. Usato da `/api/bus/status`. |
 | **Hermes API Server** | Porta 8642 — `~/.hermes/hermes-agent/gateway/platforms/api_server.py` | API HTTP Hermes usata dalla sidebar per inviare messaggi alla sessione corrente. |
-| **Hermes API key locale** | `~/.hermes/live-transcript-api-key` | Token Bearer letto da `server.py` per chiamare l'API server senza esporre la chiave nel browser. Alternativa: env `HERMES_API_KEY`. |
+| **Hermes API key locale** | `~/.hermes/live-transcript-api-key` oppure `~/.hermes/.env` | Token Bearer letto da `server.py` per chiamare l'API server senza esporre la chiave nel browser. Precedenza: env `HERMES_LIVE_TRANSCRIPT_API_KEY`, env/file `API_SERVER_KEY`, config gateway, file locale. |
 
 ## File del progetto
 
@@ -104,7 +104,7 @@ Body:
 { "session_id": "20260629_065835_af2696", "message": "..." }
 ```
 
-Il server inoltra a `POST http://127.0.0.1:8642/api/sessions/{session_id}/chat` con `Authorization: Bearer ...`, leggendo il token da `HERMES_API_KEY` o da `~/.hermes/live-transcript-api-key`. La chiave non viene mai inserita nell'HTML/JS servito al browser.
+Il server inoltra a `POST http://127.0.0.1:8642/api/sessions/{session_id}/chat` con `Authorization: Bearer ...`, leggendo il token da `HERMES_LIVE_TRANSCRIPT_API_KEY`, da `API_SERVER_KEY` in `~/.hermes/.env`, dalla config gateway o da `~/.hermes/live-transcript-api-key`. La chiave non viene mai inserita nell'HTML/JS servito al browser.
 
 ## UI / Comportamento
 

@@ -26,6 +26,8 @@ STATE_DB = Path.home() / ".hermes" / "state.db"
 BUS_LOG_DB = Path.home() / ".hermes" / "agent-bus-log.db"
 HERMES_API_BASE_URL = os.getenv("HERMES_API_BASE_URL", "http://127.0.0.1:8642")
 HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
+HERMES_CONFIG_FILE = Path.home() / ".hermes" / "config.yaml"
+HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
 MAX_SEND_CHARS = 20000
 
 # Dev mode: shorter poll, verbose logging
@@ -86,7 +88,16 @@ def should_show_agent(data: dict) -> bool:
 
 
 def get_hermes_api_key() -> str:
-    key = os.getenv("HERMES_API_KEY", "").strip()
+    key = os.getenv("HERMES_LIVE_TRANSCRIPT_API_KEY", "").strip()
+    if key:
+        return key
+    key = os.getenv("API_SERVER_KEY", "").strip()
+    if key:
+        return key
+    key = get_hermes_api_key_from_env_file()
+    if key:
+        return key
+    key = get_hermes_api_key_from_config()
     if key:
         return key
     try:
@@ -98,25 +109,113 @@ def get_hermes_api_key() -> str:
         return ""
 
 
-def call_hermes_session_chat(session_id: str, message: str) -> dict:
+def get_hermes_api_key_from_env_file() -> str:
+    try:
+        lines = HERMES_ENV_FILE.read_text().splitlines()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        log_exception("failed to read Hermes env file")
+        return ""
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() == "API_SERVER_KEY":
+            return value.strip().strip("'\"")
+    return ""
+
+
+def get_hermes_api_key_from_config() -> str:
+    try:
+        lines = HERMES_CONFIG_FILE.read_text().splitlines()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        log_exception("failed to read Hermes config")
+        return ""
+
+    in_gateway = False
+    in_platforms = False
+    in_api_server = False
+    in_extra = False
+    gateway_indent = platforms_indent = api_indent = extra_indent = -1
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+
+        if stripped == "gateway:":
+            in_gateway = True
+            in_platforms = in_api_server = in_extra = False
+            gateway_indent = indent
+            continue
+        if in_gateway and indent <= gateway_indent and stripped != "gateway:":
+            in_gateway = in_platforms = in_api_server = in_extra = False
+
+        if in_gateway and stripped == "platforms:":
+            in_platforms = True
+            in_api_server = in_extra = False
+            platforms_indent = indent
+            continue
+        if in_platforms and indent <= platforms_indent and stripped != "platforms:":
+            in_platforms = in_api_server = in_extra = False
+
+        if in_gateway and in_platforms and stripped == "api_server:":
+            in_api_server = True
+            in_extra = False
+            api_indent = indent
+            extra_indent = -1
+            continue
+        if in_api_server and indent <= api_indent and stripped != "api_server:":
+            in_api_server = False
+            in_extra = False
+        if in_api_server and stripped == "extra:":
+            in_extra = True
+            extra_indent = indent
+            continue
+        if in_extra and indent <= extra_indent and stripped != "extra:":
+            in_extra = False
+        if in_api_server and in_extra and stripped.startswith("key:"):
+            return stripped.split(":", 1)[1].strip().strip("'\"")
+    return ""
+
+
+def call_hermes_api(path: str, payload: dict, method: str = "POST", timeout: int = 600) -> dict:
     api_key = get_hermes_api_key()
     if not api_key:
         raise RuntimeError(f"Missing Hermes API key. Set HERMES_API_KEY or create {HERMES_API_KEY_FILE}")
 
-    url = f"{HERMES_API_BASE_URL.rstrip('/')}/api/sessions/{session_id}/chat"
-    payload = json.dumps({"message": message}, ensure_ascii=False).encode("utf-8")
+    url = f"{HERMES_API_BASE_URL.rstrip('/')}{path}"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
-        data=payload,
-        method="POST",
+        data=body,
+        method=method,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=600) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def create_hermes_api_session() -> str:
+    result = call_hermes_api("/api/sessions", {"title": "Live Transcript Input"}, timeout=30)
+    session = result.get("session") if isinstance(result, dict) else None
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if not session_id:
+        raise RuntimeError("Hermes API did not return a session id")
+    return session_id
+
+
+def call_hermes_session_chat(session_id: str, message: str) -> dict:
+    return call_hermes_api(f"/api/sessions/{session_id}/chat", {"message": message})
 
 
 def get_current_session_id() -> str | None:
@@ -170,7 +269,7 @@ def get_session_info(session_id: str) -> dict | None:
     try:
         with sqlite3.connect(str(STATE_DB)) as db:
             cur = db.execute(
-                "SELECT title, message_count, started_at FROM sessions WHERE id = ?",
+                "SELECT title, message_count, started_at, ended_at, end_reason, source FROM sessions WHERE id = ?",
                 (session_id,),
             )
             row = cur.fetchone()
@@ -184,10 +283,13 @@ def get_session_info(session_id: str) -> dict | None:
         "title": row[0] or "",
         "message_count": row[1] or 0,
         "started_at": row[2] or 0,
+        "ended_at": row[3] or 0,
+        "end_reason": row[4] or "",
+        "source": row[5] or "",
     }
 
 
-def get_bus_messages(limit: int = 30, after_id: int = 0) -> list[dict]:
+def get_bus_messages(limit: int = 30, after_id: int = 0, min_timestamp: float = 0) -> list[dict]:
     """Return recent agent bus messages, newest first. Optionally only after a given id."""
     if not BUS_LOG_DB.exists():
         return []
@@ -196,14 +298,18 @@ def get_bus_messages(limit: int = 30, after_id: int = 0) -> list[dict]:
             if after_id > 0:
                 cur = db.execute(
                     """SELECT id, agent, direction, content, msg_type, created_at
-                       FROM bus_messages WHERE id > ? ORDER BY id ASC""",
-                    (after_id,),
+                       FROM bus_messages
+                       WHERE id > ? AND created_at >= ?
+                       ORDER BY id ASC""",
+                    (after_id, min_timestamp),
                 )
             else:
                 cur = db.execute(
                     """SELECT id, agent, direction, content, msg_type, created_at
-                       FROM bus_messages ORDER BY id DESC LIMIT ?""",
-                    (limit,),
+                       FROM bus_messages
+                       WHERE created_at >= ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (min_timestamp, limit),
                 )
             rows = cur.fetchall()
         result = []
@@ -304,16 +410,17 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             return
 
         msgs = get_messages(sid, after_id=after)
+        session_started_at = float(session_info.get("started_at") or 0)
 
         # Merge bus messages on every poll (incremental via bus_after)
         if after == 0:
-            bus_msgs = get_bus_messages(limit)
+            bus_msgs = get_bus_messages(limit, min_timestamp=session_started_at)
         elif bus_after > 0:
-            bus_msgs = get_bus_messages(after_id=bus_after)
+            bus_msgs = get_bus_messages(after_id=bus_after, min_timestamp=session_started_at)
         else:
             # The page may have opened before any bus message existed. Keep looking
             # until the client receives a last_bus_id and switches to id polling.
-            bus_msgs = get_bus_messages(limit)
+            bus_msgs = get_bus_messages(limit, min_timestamp=session_started_at)
 
         if bus_msgs:
             if bus_after == 0:
@@ -407,11 +514,23 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 
         requested_sid = data.get("session_id") or _pinned_session_id or get_current_session_id()
         if not isinstance(requested_sid, str) or not requested_sid:
-            self._json(409, json.dumps({"error": "no active Hermes session"}).encode("utf-8"))
-            return
-        if get_session_info(requested_sid) is None:
+            requested_sid = ""
+
+        session_info = get_session_info(requested_sid) if requested_sid else None
+        if requested_sid and session_info is None:
             self._json(404, json.dumps({"error": "Hermes session not found"}).encode("utf-8"))
             return
+        if not requested_sid or session_info.get("ended_at", 0):
+            try:
+                requested_sid = create_hermes_api_session()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                self._json(exc.code, json.dumps({"error": "Hermes API could not create a session", "detail": detail}).encode("utf-8"))
+                return
+            except Exception as exc:
+                log_exception("failed to create Hermes API session")
+                self._json(502, json.dumps({"error": "Hermes API server unavailable", "detail": str(exc)}).encode("utf-8"))
+                return
 
         try:
             result = call_hermes_session_chat(requested_sid, message)
@@ -979,6 +1098,14 @@ async function sendToHermes() {
     }
     textarea.value = '';
     setSendStatus('Sent', 'ok');
+    if (data.session_id && data.session_id !== sessionId) {
+      sessionId = data.session_id;
+      lastId = 0;
+      lastBusId = 0;
+      initialized = false;
+      document.getElementById('transcript').innerHTML = '';
+      document.getElementById('msg-count').textContent = '0 messages';
+    }
     poll();
   } catch (e) {
     setSendStatus(e.message || 'Send failed', 'error');
