@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import traceback
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -216,6 +217,16 @@ def create_hermes_api_session() -> str:
 
 def call_hermes_session_chat(session_id: str, message: str) -> dict:
     return call_hermes_api(f"/api/sessions/{session_id}/chat", {"message": message})
+
+
+def send_hermes_session_chat_background(session_id: str, message: str):
+    def worker():
+        try:
+            call_hermes_session_chat(session_id, message)
+        except Exception:
+            log_exception(f"failed to send background message to Hermes session {session_id}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def get_current_session_id() -> str | None:
@@ -532,23 +543,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 self._json(502, json.dumps({"error": "Hermes API server unavailable", "detail": str(exc)}).encode("utf-8"))
                 return
 
-        try:
-            result = call_hermes_session_chat(requested_sid, message)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            self._json(exc.code, json.dumps({"error": "Hermes API rejected the message", "detail": detail}).encode("utf-8"))
-            return
-        except Exception as exc:
-            log_exception("failed to send message to Hermes API")
-            self._json(502, json.dumps({"error": "failed to send message to Hermes API", "detail": str(exc)}).encode("utf-8"))
-            return
-
+        send_hermes_session_chat_background(requested_sid, message)
         response = {
             "ok": True,
-            "session_id": result.get("session_id", requested_sid) if isinstance(result, dict) else requested_sid,
+            "queued": True,
+            "session_id": requested_sid,
         }
-        if isinstance(result, dict):
-            response["message"] = result.get("message", {})
         self._json(200, json.dumps(response, ensure_ascii=False).encode("utf-8"))
 
     def _serve_status(self):
@@ -1097,7 +1097,7 @@ async function sendToHermes() {
       throw new Error(data.error || `Send failed: ${response.status}`);
     }
     textarea.value = '';
-    setSendStatus('Sent', 'ok');
+    setSendStatus('Queued', 'ok');
     if (data.session_id && data.session_id !== sessionId) {
       sessionId = data.session_id;
       lastId = 0;
