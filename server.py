@@ -12,10 +12,11 @@ Usage:
 import json
 import sqlite3
 import sys
-import time
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8800
 STATE_DB = Path.home() / ".hermes" / "state.db"
@@ -30,12 +31,31 @@ if DEV_MODE:
 
 # Cache: pinned session ID, updated on initial poll only
 _pinned_session_id: str | None = None
+_reported_errors: set[str] = set()
 
 
 def today_midnight_ts() -> float:
-    """Return Unix timestamp for the start of today (UTC)."""
-    now = datetime.now(timezone.utc)
-    return datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp()
+    """Return Unix timestamp for the start of today in the local timezone."""
+    now = datetime.now().astimezone()
+    return datetime(now.year, now.month, now.day, tzinfo=now.tzinfo).timestamp()
+
+
+def log_exception(context: str):
+    if context in _reported_errors:
+        return
+    _reported_errors.add(context)
+    print(f"[Hermes Live] {context}", file=sys.stderr)
+    traceback.print_exc()
+
+
+def safe_int(value: str | None, default: int = 0, minimum: int | None = None) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and parsed < minimum:
+        return minimum
+    return parsed
 
 
 def get_current_session_id() -> str | None:
@@ -49,6 +69,7 @@ def get_current_session_id() -> str | None:
             row = cur.fetchone()
             return row[0] if row else None
     except Exception:
+        log_exception("failed to read current session")
         return None
 
 
@@ -80,7 +101,29 @@ def get_messages(session_id: str, after_id: int = 0) -> list[dict]:
             result.append(msg)
         return result
     except Exception:
+        log_exception(f"failed to read messages for session {session_id}")
         return []
+
+
+def get_session_info(session_id: str) -> dict | None:
+    try:
+        with sqlite3.connect(str(STATE_DB)) as db:
+            cur = db.execute(
+                "SELECT title, message_count, started_at FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        log_exception(f"failed to read session info for {session_id}")
+        return None
+
+    if not row:
+        return None
+    return {
+        "title": row[0] or "",
+        "message_count": row[1] or 0,
+        "started_at": row[2] or 0,
+    }
 
 
 def get_bus_messages(limit: int = 30, after_id: int = 0) -> list[dict]:
@@ -124,12 +167,14 @@ def get_bus_messages(limit: int = 30, after_id: int = 0) -> list[dict]:
             return result  # newest first
         return result  # chronological
     except Exception:
+        log_exception("failed to read bus messages")
         return []
 
 
 class TranscriptHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/") or "/"
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
 
         if path == "/":
             self._serve_html()
@@ -142,6 +187,18 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         else:
             self._json(404, json.dumps({"error": "not found"}).encode("utf-8"))
 
+    def do_HEAD(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path in ("/", "/api/status", "/api/current", "/api/bus/status"):
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
     def _serve_current(self):
         global _pinned_session_id
 
@@ -149,13 +206,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         bus_after = 0
         limit = 60
         requested_sid = None
-        query = self.path.split("?")
-        if len(query) > 1:
-            params = dict(p.split("=") for p in query[1].split("&") if "=" in p)
-            after = int(params.get("after", "0"))
-            bus_after = int(params.get("bus_after", "0"))
-            limit = int(params.get("limit", "60"))
-            requested_sid = params.get("session_id", None)
+        params = parse_qs(urlparse(self.path).query)
+        if params:
+            after = safe_int(params.get("after", ["0"])[0], default=0, minimum=0)
+            bus_after = safe_int(params.get("bus_after", ["0"])[0], default=0, minimum=0)
+            limit = safe_int(params.get("limit", ["60"])[0], default=60, minimum=1)
+            requested_sid = params.get("session_id", [None])[0]
 
         # Use explicit session_id if provided; else auto-detect
         if requested_sid:
@@ -172,6 +228,11 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             self._json(200, json.dumps({"session_id": None}).encode("utf-8"))
             return
 
+        session_info = get_session_info(sid)
+        if session_info is None:
+            self._json(200, json.dumps({"session_id": None}).encode("utf-8"))
+            return
+
         msgs = get_messages(sid, after_id=after)
 
         # Merge bus messages on every poll (incremental via bus_after)
@@ -180,10 +241,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         elif bus_after > 0:
             bus_msgs = get_bus_messages(after_id=bus_after)
         else:
-            bus_msgs = []
+            # The page may have opened before any bus message existed. Keep looking
+            # until the client receives a last_bus_id and switches to id polling.
+            bus_msgs = get_bus_messages(limit)
 
         if bus_msgs:
-            if after == 0:
+            if bus_after == 0:
                 bus_msgs.reverse()  # initial: newest-first → chronological for merge
             all_msgs = []
             ti, bi = 0, 0
@@ -218,21 +281,6 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         if after == 0 and len(msgs) > limit:
             msgs = msgs[-limit:]
 
-        try:
-            with sqlite3.connect(str(STATE_DB)) as db:
-                cur = db.execute(
-                    "SELECT title, message_count, started_at FROM sessions WHERE id = ?",
-                    (sid,),
-                )
-                s = cur.fetchone()
-                session_info = {
-                    "title": s[0] if s else "",
-                    "message_count": s[1] if s else 0,
-                    "started_at": s[2] if s else 0,
-                }
-        except Exception:
-            session_info = {}
-
         data = {
             "session_id": sid,
             "session": session_info,
@@ -260,6 +308,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             with urllib.request.urlopen("http://127.0.0.1:9900/agents", timeout=3) as r:
                 telemetry = json.loads(r.read())
         except Exception:
+            log_exception("failed to read agent telemetry")
             telemetry = {}
 
         # Read agent sessions for tmux attach info
@@ -267,7 +316,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         try:
             with open(Path.home() / ".hermes" / "agent-sessions.json") as f:
                 sessions = json.load(f)
+        except FileNotFoundError:
+            pass
         except Exception:
+            log_exception("failed to read agent sessions")
             pass
 
         agents = []
@@ -535,6 +587,7 @@ let lastBusId = 0;
 let sessionId = null;
 let autoScroll = true;
 let polling = false;
+let initialized = false;
 
 function toggleScroll() {
   autoScroll = !autoScroll;
@@ -554,7 +607,7 @@ async function poll() {
   if (polling) return;
   polling = true;
   try {
-    const isInitial = !sessionId || lastId === 0;
+    const isInitial = !initialized;
     const url = isInitial
       ? '/api/current?limit=' + MAX_VISIBLE
       : `/api/current?after=${lastId}&bus_after=${lastBusId}&session_id=${encodeURIComponent(sessionId)}`;
@@ -573,19 +626,29 @@ async function poll() {
       sessionId = data.session_id;
       lastId = 0;
       lastBusId = 0;
+      initialized = false;
       document.getElementById('transcript').innerHTML = '';
       document.getElementById('msg-count').textContent = '0 messages';
       document.getElementById('dot').className = 'dot live';
       document.getElementById('status-text').textContent = 'live';
     }
+    initialized = true;
 
     if (data.session) {
       const s = data.session;
       const title = s.title || '(untitled)';
       const count = s.message_count || 0;
       const date = s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '?';
-      document.getElementById('session-info').innerHTML =
-        `<strong>${title}</strong> &middot; ${count} msgs &middot; started ${date} &middot; <code>${sessionId.slice(0,20)}...</code>`;
+      const info = document.getElementById('session-info');
+      const titleEl = document.createElement('strong');
+      titleEl.textContent = title;
+      const sidEl = document.createElement('code');
+      sidEl.textContent = sessionId.slice(0, 20) + '...';
+      info.replaceChildren(
+        titleEl,
+        document.createTextNode(` · ${count} msgs · started ${date} · `),
+        sidEl
+      );
     }
 
     if (data.messages && data.messages.length > 0) {
@@ -612,24 +675,34 @@ function appendMessages(messages) {
     const el = document.createElement('div');
     el.className = 'msg';
 
-    let roleLabel = msg.display || msg.role;
-    let time = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString() : '';
-    let content = msg.content || '';
-    let toolInfo = '';
-
-    if (msg.tool_name) {
-      toolInfo = `<div class="tool-detail">${msg.tool_name}</div>`;
-    }
+    const roleLabel = String(msg.display || msg.role || 'message');
+    const roleClass = roleLabel.replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+    const time = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString() : '';
+    const content = String(msg.content || '');
 
     const needsCollapse = content.length > 500;
-    el.innerHTML = `
-      <div class="msg-header">
-        <span class="msg-role ${roleLabel}">${roleLabel}</span>
-        <span class="msg-time">${time}</span>
-      </div>
-      <div class="msg-content ${needsCollapse ? 'collapsed' : ''}" onclick="this.classList.toggle('collapsed')">${escapeHtml(content)}</div>
-      ${toolInfo}
-    `;
+    const header = document.createElement('div');
+    header.className = 'msg-header';
+    const role = document.createElement('span');
+    role.className = `msg-role ${roleClass}`;
+    role.textContent = roleLabel;
+    const timeEl = document.createElement('span');
+    timeEl.className = 'msg-time';
+    timeEl.textContent = time;
+    header.append(role, timeEl);
+
+    const contentEl = document.createElement('div');
+    contentEl.className = `msg-content ${needsCollapse ? 'collapsed' : ''}`;
+    contentEl.textContent = content;
+    contentEl.addEventListener('click', () => contentEl.classList.toggle('collapsed'));
+
+    el.append(header, contentEl);
+    if (msg.tool_name) {
+      const toolInfo = document.createElement('div');
+      toolInfo.className = 'tool-detail';
+      toolInfo.textContent = String(msg.tool_name);
+      el.appendChild(toolInfo);
+    }
     container.appendChild(el);
   }
 
@@ -641,15 +714,8 @@ function appendMessages(messages) {
   }
 }
 
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
 function clearTranscript() {
   document.getElementById('transcript').innerHTML = '<div class="empty">Cleared — waiting for new messages...</div>';
-  lastId = 0;
   document.getElementById('msg-count').textContent = '0 messages';
 }
 
@@ -666,10 +732,16 @@ let tooltipHideTimer = null;
 
 function showTooltip(cmd, x, y) {
   if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
-  tooltipEl.innerHTML = '<span class="tt-cmd">' + escapeHtml(cmd) + '</span><span class="tt-hint">Click to copy</span>';
+  const cmdEl = document.createElement('span');
+  cmdEl.className = 'tt-cmd';
+  cmdEl.textContent = cmd;
+  const hintEl = document.createElement('span');
+  hintEl.className = 'tt-hint';
+  hintEl.textContent = 'Click to copy';
+  tooltipEl.replaceChildren(cmdEl, hintEl);
+  tooltipEl.style.display = 'block';
   tooltipEl.style.left = Math.min(x, window.innerWidth - tooltipEl.offsetWidth - 20) + 'px';
   tooltipEl.style.top = (y + 16) + 'px';
-  tooltipEl.style.display = 'block';
   tooltipEl.dataset.cmd = cmd;
 }
 
@@ -704,23 +776,34 @@ function pollAgentBar() {
     .then(r => r.json())
     .then(data => {
       const bar = document.getElementById('agent-bar');
+      const prefix = document.createElement('span');
+      prefix.style.color = 'var(--muted)';
+      prefix.textContent = 'agents:';
       if (!data.agents || data.agents.length === 0) {
-        bar.innerHTML = '<span style="color:var(--muted)">agents: <em>none connected</em></span>';
+        const none = document.createElement('em');
+        none.textContent = ' none connected';
+        prefix.appendChild(none);
+        bar.replaceChildren(prefix);
         return;
       }
-      let html = '<span style="color:var(--muted)">agents:</span>';
+      const nodes = [prefix];
       for (const a of data.agents) {
         const displayName = a.name === 'agy' ? 'gemini' : a.name;
         const color = agentColors[displayName] || 'var(--text)';
         const label = a.type ? `${displayName} (${a.type})` : displayName;
-        let badge = `<span class="agent-badge" style="color:${color};cursor:pointer"`;
+        const badge = document.createElement('span');
+        badge.className = 'agent-badge';
+        badge.style.color = color;
+        badge.style.cursor = 'pointer';
         if (a.tmux_attach) {
-          badge += ` data-tmux="${a.tmux_attach.replace(/"/g,'&quot;')}"`;
+          badge.dataset.tmux = a.tmux_attach;
         }
-        badge += `><span class="dot ${a.alive ? 'alive' : 'dead'}"></span>${label}</span>`;
-        html += badge;
+        const dot = document.createElement('span');
+        dot.className = `dot ${a.alive ? 'alive' : 'dead'}`;
+        badge.append(dot, document.createTextNode(label));
+        nodes.push(badge);
       }
-      bar.innerHTML = html;
+      bar.replaceChildren(...nodes);
 
       // Attach hover events for tooltip badges via delegation
       bar.querySelectorAll('.agent-badge[data-tmux]').forEach(el => {

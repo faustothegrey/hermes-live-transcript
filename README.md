@@ -54,7 +54,7 @@ Utile per:
 |------|-------------|
 | **server.py** | Server HTTP + pagina web. Unico file Python — contiene backend API + frontend HTML/CSS/JS inline. |
 | **log-bus.py** | Utility CLI per scrivere messaggi su `agent-bus-log.db`. Usata da script esterni che vogliono far apparire messaggi di agenti nella UI. |
-| **archive-old-sessions.py** | Utility per archiviare sessioni Hermes vecchie (>N giorni) in un DB separato, riducendo la dimensione di state.db. Uso: `python3 archive-old-sessions.py --days 6`. |
+| **archive-old-sessions.py** | Utility per archiviare sessioni Hermes vecchie (>N giorni) in un DB separato, riducendo la dimensione di state.db. Usa la backup API di SQLite per includere correttamente eventuali contenuti WAL; l'archivio finale contiene solo le sessioni vecchie. Uso: `python3 archive-old-sessions.py --days 6`. |
 | **com.fausto.hermes-live-transcript.plist** | LaunchAgent plist per launchd. Copia locale (quella attiva è in `~/Library/LaunchAgents/`). |
 
 ## API
@@ -122,19 +122,25 @@ Quando Hermes risponde con solo chiamate a strumenti (es. `terminal`) e nessun c
 
 **Fix applicato**: filtro SQL `AND NOT (role='assistant' AND (content IS NULL OR content=''))` in `get_messages()`.
 
-### 4. Agent bus merge inconsistente
+### 4. Agent bus merge / polling inconsistente
 
-I messaggi dell'Agent Bus (con ID negativo, `is_bus=true`) vengono fusi con i messaggi transcript ordinando per timestamp. Se due messaggi hanno lo stesso timestamp, l'ordine è indeterminato. Inoltre, il merge può causare duplicati se il trim taglia via messaggi transcript e il `last_transcript_id` retrocede.
+I messaggi dell'Agent Bus (con ID negativo, `is_bus=true`) vengono fusi con i messaggi transcript ordinando per timestamp. Se due messaggi hanno lo stesso timestamp, l'ordine è indeterminato. Inoltre, il merge poteva causare duplicati se il trim tagliava via messaggi transcript e il `last_transcript_id` retrocedeva; un altro caso problematico era l'apertura della pagina prima dell'arrivo di qualunque messaggio bus, perché `last_bus_id` restava 0 e i poll successivi non interrogavano più il DB bus.
 
-**Fix applicato**: estrazione di `last_transcript_id` e `last_bus_id` prima del trim, non dopo.
+**Fix applicato**: estrazione di `last_transcript_id` e `last_bus_id` prima del trim, poll incrementale del bus anche quando il client non ha ancora un `last_bus_id`, e stato client `initialized` separato da `last_transcript_id`.
 
-### 5. Assenza di ricarica automatica del JS
+### 5. Archiviazione SQLite WAL
+
+`state.db` usa SQLite e può avere contenuti recenti nel file WAL. Copiare solo `state.db` a livello filesystem rischia un archivio incompleto.
+
+**Fix applicato**: `archive-old-sessions.py` usa `sqlite3.Connection.backup()` e poi pota l'archivio lasciando solo le sessioni vecchie. Le tabelle FTS vengono aggiornate dai trigger `messages_*`, non cancellate manualmente.
+
+### 6. Assenza di ricarica automatica del JS
 
 Le modifiche a `server.py` (in particolare alla parte HTML/JS inline) richiedono un hard refresh del browser (`Cmd+Shift+R`) perché la pagina HTML è generata dal server ma potrebbe essere cacheata dal browser.
 
 **Nota**: il poll AJAX va sempre all'API corrente, quindi i dati sono sempre freschi. Solo il template HTML/JS iniziale può essere stale.
 
-### 6. Singolo thread
+### 7. Singolo thread
 
 Il server usa `http.server.HTTPServer` di Python che è single-thread. In condizioni di uso intenso (decine di richieste al secondo), potrebbe diventare un collo di bottiglia. Per il carico attuale (1-2 utenti, poll ogni 1-3s) è ampiamente sufficiente.
 
