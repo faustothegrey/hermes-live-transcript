@@ -17,9 +17,19 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8800
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8800
 STATE_DB = Path.home() / ".hermes" / "state.db"
 BUS_LOG_DB = Path.home() / ".hermes" / "agent-bus-log.db"
+
+# Dev mode: shorter poll, verbose logging
+DEV_MODE = "--dev" in sys.argv
+POLL_INTERVAL = 1000 if DEV_MODE else 3000  # ms
+
+if DEV_MODE:
+    print(f"  ⚠ DEV MODE — poll every {POLL_INTERVAL}ms")
+
+# Cache: pinned session ID, updated on initial poll only
+_pinned_session_id: str | None = None
 
 
 def today_midnight_ts() -> float:
@@ -29,11 +39,11 @@ def today_midnight_ts() -> float:
 
 
 def get_current_session_id() -> str | None:
-    """Return the most recent session started today."""
+    """Return the most recent non-cron session started today."""
     try:
         with sqlite3.connect(str(STATE_DB)) as db:
             cur = db.execute(
-                "SELECT id FROM sessions WHERE started_at >= ? ORDER BY started_at DESC LIMIT 1",
+                "SELECT id FROM sessions WHERE started_at >= ? AND id NOT LIKE 'cron_%' ORDER BY started_at DESC LIMIT 1",
                 (today_midnight_ts(),),
             )
             row = cur.fetchone()
@@ -51,6 +61,7 @@ def get_messages(session_id: str, after_id: int = 0) -> list[dict]:
                 """SELECT id, role, content, tool_name, tool_calls, timestamp
                    FROM messages
                    WHERE session_id = ? AND id > ? AND role NOT IN ('tool', 'session_meta')
+                     AND NOT (role = 'assistant' AND (content IS NULL OR content = ''))
                    ORDER BY id ASC""",
                 (session_id, after_id),
             )
@@ -132,20 +143,34 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             self._json(404, json.dumps({"error": "not found"}).encode("utf-8"))
 
     def _serve_current(self):
-        sid = get_current_session_id()
-        if not sid:
-            self._json(200, json.dumps({"session_id": None}).encode("utf-8"))
-            return
+        global _pinned_session_id
 
         after = 0
         bus_after = 0
         limit = 60
+        requested_sid = None
         query = self.path.split("?")
         if len(query) > 1:
             params = dict(p.split("=") for p in query[1].split("&") if "=" in p)
             after = int(params.get("after", "0"))
             bus_after = int(params.get("bus_after", "0"))
             limit = int(params.get("limit", "60"))
+            requested_sid = params.get("session_id", None)
+
+        # Use explicit session_id if provided; else auto-detect
+        if requested_sid:
+            sid = requested_sid
+        elif after == 0:
+            # Initial poll — refresh the pin
+            sid = get_current_session_id()
+            _pinned_session_id = sid
+        else:
+            # Incremental poll — use cached pin
+            sid = _pinned_session_id
+
+        if not sid:
+            self._json(200, json.dumps({"session_id": None}).encode("utf-8"))
+            return
 
         msgs = get_messages(sid, after_id=after)
 
@@ -173,7 +198,23 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             all_msgs.extend(bus_msgs[bi:])
             msgs = all_msgs
 
-        # Always cap at limit after merge/trim
+        # Extract last_id values BEFORE trim so they never regress
+        last_transcript_id = None
+        last_bus_id = None
+        last_id = None
+        if msgs:
+            last = msgs[-1]
+            last_id = last.get("id") or last.get("bus_id") or 0
+            for m in reversed(msgs):
+                tid = m.get("id", 0)
+                if tid and tid > 0 and last_transcript_id is None:
+                    last_transcript_id = tid
+                if m.get("is_bus") and m.get("bus_id", 0) > 0 and last_bus_id is None:
+                    last_bus_id = m["bus_id"]
+                if last_transcript_id is not None and last_bus_id is not None:
+                    break
+
+        # Cap on initial poll only
         if after == 0 and len(msgs) > limit:
             msgs = msgs[-limit:]
 
@@ -197,20 +238,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             "session": session_info,
             "messages": msgs,
         }
-        if msgs:
-            last = msgs[-1]
-            data["last_id"] = last.get("id") or last.get("bus_id") or 0
-            # For incremental polling, use the last transcript message id
-            for m in reversed(msgs):
-                tid = m.get("id", 0)
-                if tid and tid > 0:
-                    data["last_transcript_id"] = tid
-                    break
-            # Track the highest bus internal id for bus_after
-            for m in reversed(msgs):
-                if m.get("is_bus") and m.get("bus_id", 0) > 0:
-                    data["last_bus_id"] = m["bus_id"]
-                    break
+        if last_id is not None:
+            data["last_id"] = last_id
+        if last_transcript_id is not None:
+            data["last_transcript_id"] = last_transcript_id
+        if last_bus_id is not None:
+            data["last_bus_id"] = last_bus_id
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self._json(200, body)
 
@@ -524,7 +557,7 @@ async function poll() {
     const isInitial = !sessionId || lastId === 0;
     const url = isInitial
       ? '/api/current?limit=' + MAX_VISIBLE
-      : `/api/current?after=${lastId}&bus_after=${lastBusId}`;
+      : `/api/current?after=${lastId}&bus_after=${lastBusId}&session_id=${encodeURIComponent(sessionId)}`;
     const r = await fetch(url);
     const data = await r.json();
 
@@ -657,7 +690,7 @@ tooltipEl.addEventListener('click', () => {
   if (cmd) copyTmux(cmd, tooltipEl);
 });
 
-setInterval(poll, 3000);
+setInterval(poll, __POLL_INTERVAL__);
 poll();
 
 // Agent liveness bar
@@ -704,6 +737,10 @@ function pollAgentBar() {
 </script>
 </body>
 </html>"""
+        html = html.replace("__POLL_INTERVAL__", str(POLL_INTERVAL))
+        if DEV_MODE:
+            html = html.replace("</head>",
+                "<script>console.log('[Hermes Live] DEV MODE — poll interval %sms')</script></head>" % POLL_INTERVAL)
         self._html(html)
 
     def _html(self, content: str):
