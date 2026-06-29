@@ -47,6 +47,8 @@ Utile per:
 | **LaunchAgent plist** | `~/Library/LaunchAgents/com.fausto.hermes-live-transcript.plist` | Configurazione launchd per avvio persistente. KeepAlive + RunAtLoad. |
 | **Log di servizio** | `~/.hermes/logs/live-transcript.log` | stdout/stderr del processo server (vuoto in condizioni normali, errori vanno qui). |
 | **Agent Telemetry** | Porta 9900 — `~/Software/scripts-ai/agent_telemetry.py` | Servizio HTTP che taila i log di Claude Code, Codex, Antigravity. Usato da `/api/bus/status`. |
+| **Hermes API Server** | Porta 8642 — `~/.hermes/hermes-agent/gateway/platforms/api_server.py` | API HTTP Hermes usata dalla sidebar per inviare messaggi alla sessione corrente. |
+| **Hermes API key locale** | `~/.hermes/live-transcript-api-key` | Token Bearer letto da `server.py` per chiamare l'API server senza esporre la chiave nel browser. Alternativa: env `HERMES_API_KEY`. |
 
 ## File del progetto
 
@@ -93,12 +95,24 @@ Restituisce `{"session_id": "...", "ok": true}` se esiste una sessione attiva og
 
 Restituisce lo stato di vita degli agenti esterni (letto da Agent Telemetry su port 9900).
 
+### `POST /api/send`
+
+Invia un messaggio alla sessione Hermes corrente passando dal proxy locale `server.py`.
+
+Body:
+```json
+{ "session_id": "20260629_065835_af2696", "message": "..." }
+```
+
+Il server inoltra a `POST http://127.0.0.1:8642/api/sessions/{session_id}/chat` con `Authorization: Bearer ...`, leggendo il token da `HERMES_API_KEY` o da `~/.hermes/live-transcript-api-key`. La chiave non viene mai inserita nell'HTML/JS servito al browser.
+
 ## UI / Comportamento
 
 - **Polling automatico** ogni N ms (configurabile via `--dev` = 1s, default = 3s)
 - **Messaggi ordinati dal più recente in alto** (`flex-direction: column-reverse`)
 - **Collassamento automatico** dei messaggi lunghi (>500 caratteri) — click per espandere
 - **Badge agenti** in alto con pallino verde (vivo) / rosso (morto) — hover per comando tmux attach, click per copiare
+- **Sidebar input** per inviare messaggi a Hermes tramite API server locale, mantenendo il transcript in polling mentre Hermes elabora
 - **Limit visibile**: ultimi 60 messaggi (i più vecchi vengono rimossi dal DOM)
 - **Auto-scroll**: i nuovi messaggi appaiono in cima automaticamente
 

@@ -10,17 +10,23 @@ Usage:
 """
 
 import json
+import os
 import sqlite3
 import sys
 import traceback
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+import urllib.error
+import urllib.request
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8800
 STATE_DB = Path.home() / ".hermes" / "state.db"
 BUS_LOG_DB = Path.home() / ".hermes" / "agent-bus-log.db"
+HERMES_API_BASE_URL = os.getenv("HERMES_API_BASE_URL", "http://127.0.0.1:8642")
+HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
+MAX_SEND_CHARS = 20000
 
 # Dev mode: shorter poll, verbose logging
 DEV_MODE = "--dev" in sys.argv
@@ -77,6 +83,40 @@ def should_show_agent(data: dict) -> bool:
         return True
 
     return datetime.now().timestamp() - last_activity <= DEAD_AGENT_HIDE_AFTER_SECONDS
+
+
+def get_hermes_api_key() -> str:
+    key = os.getenv("HERMES_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return HERMES_API_KEY_FILE.read_text().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        log_exception("failed to read Hermes API key")
+        return ""
+
+
+def call_hermes_session_chat(session_id: str, message: str) -> dict:
+    api_key = get_hermes_api_key()
+    if not api_key:
+        raise RuntimeError(f"Missing Hermes API key. Set HERMES_API_KEY or create {HERMES_API_KEY_FILE}")
+
+    url = f"{HERMES_API_BASE_URL.rstrip('/')}/api/sessions/{session_id}/chat"
+    payload = json.dumps({"message": message}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=600) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def get_current_session_id() -> str | None:
@@ -208,6 +248,15 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         else:
             self._json(404, json.dumps({"error": "not found"}).encode("utf-8"))
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/api/send":
+            self._serve_send()
+        else:
+            self._json(404, json.dumps({"error": "not found"}).encode("utf-8"))
+
     def do_HEAD(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -316,6 +365,73 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self._json(200, body)
 
+    def _read_json_body(self, max_bytes: int = 65536) -> dict | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json(400, json.dumps({"error": "invalid content length"}).encode("utf-8"))
+            return None
+        if length <= 0:
+            self._json(400, json.dumps({"error": "empty request body"}).encode("utf-8"))
+            return None
+        if length > max_bytes:
+            self._json(413, json.dumps({"error": "request body too large"}).encode("utf-8"))
+            return None
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            data = json.loads(raw)
+        except Exception:
+            self._json(400, json.dumps({"error": "invalid JSON body"}).encode("utf-8"))
+            return None
+        if not isinstance(data, dict):
+            self._json(400, json.dumps({"error": "JSON body must be an object"}).encode("utf-8"))
+            return None
+        return data
+
+    def _serve_send(self):
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        message = data.get("message", "")
+        if not isinstance(message, str):
+            self._json(400, json.dumps({"error": "message must be a string"}).encode("utf-8"))
+            return
+        message = message.strip()
+        if not message:
+            self._json(400, json.dumps({"error": "message is required"}).encode("utf-8"))
+            return
+        if len(message) > MAX_SEND_CHARS:
+            self._json(400, json.dumps({"error": f"message is too long; max {MAX_SEND_CHARS} chars"}).encode("utf-8"))
+            return
+
+        requested_sid = data.get("session_id") or _pinned_session_id or get_current_session_id()
+        if not isinstance(requested_sid, str) or not requested_sid:
+            self._json(409, json.dumps({"error": "no active Hermes session"}).encode("utf-8"))
+            return
+        if get_session_info(requested_sid) is None:
+            self._json(404, json.dumps({"error": "Hermes session not found"}).encode("utf-8"))
+            return
+
+        try:
+            result = call_hermes_session_chat(requested_sid, message)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self._json(exc.code, json.dumps({"error": "Hermes API rejected the message", "detail": detail}).encode("utf-8"))
+            return
+        except Exception as exc:
+            log_exception("failed to send message to Hermes API")
+            self._json(502, json.dumps({"error": "failed to send message to Hermes API", "detail": str(exc)}).encode("utf-8"))
+            return
+
+        response = {
+            "ok": True,
+            "session_id": result.get("session_id", requested_sid) if isinstance(result, dict) else requested_sid,
+        }
+        if isinstance(result, dict):
+            response["message"] = result.get("message", {})
+        self._json(200, json.dumps(response, ensure_ascii=False).encode("utf-8"))
+
     def _serve_status(self):
         sid = get_current_session_id()
         data = {"session_id": sid, "ok": sid is not None}
@@ -390,7 +506,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
     padding: 20px;
-    max-width: 900px;
+    max-width: 1240px;
     margin: 0 auto;
   }
   header {
@@ -432,6 +548,72 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   }
   .controls button:hover { background: #21262d; }
   .controls button.active { border-color: var(--hermes); }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 18px;
+    align-items: start;
+  }
+  .main-pane {
+    min-width: 0;
+  }
+  .send-panel {
+    position: sticky;
+    top: 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .send-panel h2 {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  #send-message {
+    width: 100%;
+    min-height: 180px;
+    resize: vertical;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #0d1117;
+    color: var(--text);
+    padding: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  #send-message:focus {
+    outline: none;
+    border-color: var(--hermes);
+  }
+  .send-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  #btn-send {
+    background: var(--hermes);
+    border: 1px solid var(--hermes);
+    color: #0d1117;
+    padding: 7px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  #btn-send:disabled {
+    opacity: 0.6;
+    cursor: wait;
+  }
+  #send-status {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  #send-status.error { color: #ff7b72; }
+  #send-status.ok { color: #3fb950; }
   #msg-count {
     font-size: 12px;
     color: var(--muted);
@@ -580,6 +762,11 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     margin-top: 4px;
     text-align: center;
   }
+  @media (max-width: 900px) {
+    body { padding: 14px; }
+    .layout { grid-template-columns: 1fr; }
+    .send-panel { position: static; }
+  }
 </style>
 </head>
 <body>
@@ -594,14 +781,27 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 <div id="agent-bar"><span style="color:var(--muted)">agents:</span></div>
 <div id="agent-tooltip"></div>
 
-<div class="controls">
-  <button id="btn-scroll" class="active" onclick="toggleScroll()">Auto-scroll</button>
-  <button onclick="clearTranscript()">Clear</button>
-  <span id="msg-count">0 messages</span>
-</div>
+<div class="layout">
+  <main class="main-pane">
+    <div class="controls">
+      <button id="btn-scroll" class="active" onclick="toggleScroll()">Auto-scroll</button>
+      <button onclick="clearTranscript()">Clear</button>
+      <span id="msg-count">0 messages</span>
+    </div>
 
-<div id="transcript">
-  <div class="empty">Waiting for messages...</div>
+    <div id="transcript">
+      <div class="empty">Waiting for messages...</div>
+    </div>
+  </main>
+
+  <aside class="send-panel">
+    <h2>Send to Hermes</h2>
+    <textarea id="send-message" placeholder="Type a message..."></textarea>
+    <div class="send-actions">
+      <button id="btn-send" onclick="sendToHermes()">Send</button>
+      <span id="send-status">Ready</span>
+    </div>
+  </aside>
 </div>
 
 <script>
@@ -635,6 +835,7 @@ async function poll() {
       ? '/api/current?limit=' + MAX_VISIBLE
       : `/api/current?after=${lastId}&bus_after=${lastBusId}&session_id=${encodeURIComponent(sessionId)}`;
     const r = await fetch(url);
+    if (!r.ok) throw new Error(`poll failed: ${r.status}`);
     const data = await r.json();
 
     if (!data.session_id) {
@@ -655,6 +856,8 @@ async function poll() {
       document.getElementById('dot').className = 'dot live';
       document.getElementById('status-text').textContent = 'live';
     }
+    document.getElementById('dot').className = 'dot live';
+    document.getElementById('status-text').textContent = 'live';
     initialized = true;
 
     if (data.session) {
@@ -741,6 +944,55 @@ function clearTranscript() {
   document.getElementById('transcript').innerHTML = '<div class="empty">Cleared — waiting for new messages...</div>';
   document.getElementById('msg-count').textContent = '0 messages';
 }
+
+function setSendStatus(text, state) {
+  const el = document.getElementById('send-status');
+  el.textContent = text;
+  el.className = state || '';
+}
+
+async function sendToHermes() {
+  const textarea = document.getElementById('send-message');
+  const button = document.getElementById('btn-send');
+  const message = textarea.value.trim();
+  if (!message) {
+    setSendStatus('Message is empty', 'error');
+    textarea.focus();
+    return;
+  }
+  if (!sessionId) {
+    setSendStatus('No active session', 'error');
+    return;
+  }
+
+  button.disabled = true;
+  setSendStatus('Sending...', '');
+  try {
+    const response = await fetch('/api/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message, session_id: sessionId})
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || `Send failed: ${response.status}`);
+    }
+    textarea.value = '';
+    setSendStatus('Sent', 'ok');
+    poll();
+  } catch (e) {
+    setSendStatus(e.message || 'Send failed', 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById('send-message').addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+    event.preventDefault();
+    sendToHermes();
+  }
+});
 
 function copyTmux(cmd, el) {
   navigator.clipboard.writeText(cmd).then(() => {
@@ -868,7 +1120,7 @@ function pollAgentBar() {
 
 
 def main():
-    server = HTTPServer(("127.0.0.1", PORT), TranscriptHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), TranscriptHandler)
     print(f"Hermes Live Transcript: http://127.0.0.1:{PORT}")
     print(f"  Reading from: {STATE_DB}")
     sid = get_current_session_id()
