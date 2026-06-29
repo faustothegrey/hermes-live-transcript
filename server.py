@@ -11,9 +11,11 @@ Usage:
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -30,6 +32,8 @@ HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
 HERMES_CONFIG_FILE = Path.home() / ".hermes" / "config.yaml"
 HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
 MAX_SEND_CHARS = 20000
+LIVE_MESSAGE_TTL_SECONDS = 20 * 60
+MAX_LIVE_MESSAGES_PER_SESSION = 20
 
 # Dev mode: shorter poll, verbose logging
 DEV_MODE = "--dev" in sys.argv
@@ -42,6 +46,8 @@ if DEV_MODE:
 # Cache: pinned session ID, updated on initial poll only
 _pinned_session_id: str | None = None
 _reported_errors: set[str] = set()
+_live_lock = threading.Lock()
+_live_messages_by_session: dict[str, dict[str, dict]] = {}
 
 
 def today_midnight_ts() -> float:
@@ -56,6 +62,138 @@ def log_exception(context: str):
     _reported_errors.add(context)
     print(f"[Hermes Live] {context}", file=sys.stderr)
     traceback.print_exc()
+
+
+def normalize_message_content(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def prune_live_messages_locked(now: float | None = None):
+    now = now or time.time()
+    empty_sessions = []
+    for session_id, messages in _live_messages_by_session.items():
+        stale_keys = [
+            key for key, msg in messages.items()
+            if now - float(msg.get("updated_at") or msg.get("timestamp") or 0) > LIVE_MESSAGE_TTL_SECONDS
+        ]
+        for key in stale_keys:
+            messages.pop(key, None)
+        if not messages:
+            empty_sessions.append(session_id)
+    for session_id in empty_sessions:
+        _live_messages_by_session.pop(session_id, None)
+
+
+def live_message_key(message_id: str | None) -> str:
+    return f"live:{message_id or 'assistant'}"
+
+
+def upsert_live_message(session_id: str, message_id: str | None, **updates):
+    if not session_id:
+        return
+    now = time.time()
+    key = live_message_key(message_id)
+    with _live_lock:
+        prune_live_messages_locked(now)
+        session_messages = _live_messages_by_session.setdefault(session_id, {})
+        msg = session_messages.get(key)
+        if msg is None:
+            msg = {
+                "id": key,
+                "session_id": session_id,
+                "role": "assistant",
+                "display": "hermes",
+                "content": "",
+                "timestamp": now,
+                "live": True,
+                "completed": False,
+                "source": "hermes_sse",
+            }
+            session_messages[key] = msg
+        msg.update(updates)
+        msg["updated_at"] = now
+
+        while len(session_messages) > MAX_LIVE_MESSAGES_PER_SESSION:
+            oldest_key = min(
+                session_messages,
+                key=lambda k: float(session_messages[k].get("updated_at") or session_messages[k].get("timestamp") or 0),
+            )
+            session_messages.pop(oldest_key, None)
+
+
+def append_live_delta(session_id: str, message_id: str | None, delta: str):
+    if not delta:
+        return
+    key = live_message_key(message_id)
+    with _live_lock:
+        existing = _live_messages_by_session.get(session_id, {}).get(key, {})
+        content = str(existing.get("content") or "") + delta
+    upsert_live_message(session_id, message_id, content=content, completed=False)
+
+
+def reconcile_live_messages_locked(session_id: str, committed_messages: list[dict]):
+    session_messages = _live_messages_by_session.get(session_id)
+    if not session_messages:
+        return
+
+    committed = []
+    for msg in committed_messages:
+        if msg.get("is_bus") or msg.get("live"):
+            continue
+        role = str(msg.get("role") or "").lower()
+        display = str(msg.get("display") or "").lower()
+        if role not in ("user", "assistant") and display not in ("human", "hermes"):
+            continue
+        content = normalize_message_content(msg.get("content"))
+        if content:
+            committed.append((role, display, content))
+
+    if not committed:
+        return
+
+    matched_keys = []
+    for key, live in session_messages.items():
+        live_content = normalize_message_content(live.get("content"))
+        if not live_content:
+            continue
+        live_role = str(live.get("role") or "").lower()
+        live_display = str(live.get("display") or "").lower()
+        live_completed = bool(live.get("completed"))
+        for role, display, content in committed:
+            same_role = (
+                role == live_role
+                or display == live_display
+                or (role == "assistant" and live_display == "hermes")
+                or (role == "user" and live_display == "human")
+            )
+            if not same_role:
+                continue
+            if content == live_content:
+                matched_keys.append(key)
+                break
+            if not live_completed and len(live_content) >= 24 and content.startswith(live_content):
+                matched_keys.append(key)
+                break
+
+    for key in matched_keys:
+        session_messages.pop(key, None)
+    if not session_messages:
+        _live_messages_by_session.pop(session_id, None)
+
+
+def get_live_messages(session_id: str, committed_messages: list[dict] | None = None) -> list[dict]:
+    with _live_lock:
+        prune_live_messages_locked()
+        if committed_messages:
+            reconcile_live_messages_locked(session_id, committed_messages)
+        live = []
+        for msg in _live_messages_by_session.get(session_id, {}).values():
+            if not normalize_message_content(msg.get("content")):
+                continue
+            copy = {k: v for k, v in msg.items() if k != "updated_at"}
+            live.append(copy)
+    live.sort(key=lambda m: float(m.get("timestamp") or 0))
+    return live
 
 
 def safe_int(value: str | None, default: int = 0, minimum: int | None = None) -> int:
@@ -219,12 +357,99 @@ def call_hermes_session_chat(session_id: str, message: str) -> dict:
     return call_hermes_api(f"/api/sessions/{session_id}/chat", {"message": message})
 
 
+def iter_sse_events(response):
+    event_name = None
+    data_lines: list[str] = []
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if data_lines:
+                data_raw = "\n".join(data_lines)
+                try:
+                    data = json.loads(data_raw)
+                except json.JSONDecodeError:
+                    data = {"raw": data_raw}
+                yield event_name or "message", data
+            event_name = None
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].lstrip())
+    if data_lines:
+        data_raw = "\n".join(data_lines)
+        try:
+            data = json.loads(data_raw)
+        except json.JSONDecodeError:
+            data = {"raw": data_raw}
+        yield event_name or "message", data
+
+
+def handle_hermes_stream_event(default_session_id: str, event_name: str, payload: dict):
+    if not isinstance(payload, dict):
+        return
+    session_id = str(payload.get("session_id") or default_session_id or "")
+    if not session_id:
+        return
+
+    if event_name == "message.started":
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        message_id = str(message.get("id") or payload.get("message_id") or "assistant")
+        role = str(message.get("role") or "assistant")
+        upsert_live_message(session_id, message_id, role=role, display="hermes" if role == "assistant" else role)
+    elif event_name == "assistant.delta":
+        message_id = str(payload.get("message_id") or "assistant")
+        append_live_delta(session_id, message_id, str(payload.get("delta") or ""))
+    elif event_name == "assistant.completed":
+        message_id = str(payload.get("message_id") or "assistant")
+        content = payload.get("content")
+        updates = {"completed": True}
+        if isinstance(content, str) and content:
+            updates["content"] = content
+        upsert_live_message(session_id, message_id, **updates)
+    elif event_name in ("error", "done"):
+        return
+
+
+def call_hermes_session_chat_stream(session_id: str, message: str):
+    api_key = get_hermes_api_key()
+    if not api_key:
+        raise RuntimeError(f"Missing Hermes API key. Set HERMES_LIVE_TRANSCRIPT_API_KEY or create {HERMES_API_KEY_FILE}")
+
+    url = f"{HERMES_API_BASE_URL.rstrip('/')}/api/sessions/{session_id}/chat/stream"
+    body = json.dumps({"message": message}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=600) as response:
+        for event_name, payload in iter_sse_events(response):
+            handle_hermes_stream_event(session_id, event_name, payload)
+
+
 def send_hermes_session_chat_background(session_id: str, message: str):
     def worker():
         try:
-            call_hermes_session_chat(session_id, message)
+            call_hermes_session_chat_stream(session_id, message)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                try:
+                    call_hermes_session_chat(session_id, message)
+                    return
+                except Exception:
+                    pass
+            log_exception(f"failed to stream background message to Hermes session {session_id}")
         except Exception:
-            log_exception(f"failed to send background message to Hermes session {session_id}")
+            log_exception(f"failed to stream background message to Hermes session {session_id}")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -449,21 +674,27 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             all_msgs.extend(bus_msgs[bi:])
             msgs = all_msgs
 
+        live_msgs = get_live_messages(sid, committed_messages=msgs)
+        if live_msgs:
+            msgs = sorted(
+                [*msgs, *live_msgs],
+                key=lambda m: (float(m.get("timestamp") or 0), 1 if m.get("live") else 0),
+            )
+
         # Extract last_id values BEFORE trim so they never regress
         last_transcript_id = None
         last_bus_id = None
         last_id = None
         if msgs:
-            last = msgs[-1]
-            last_id = last.get("id") or last.get("bus_id") or 0
             for m in reversed(msgs):
                 tid = m.get("id", 0)
-                if tid and tid > 0 and last_transcript_id is None:
+                if isinstance(tid, int) and tid > 0 and last_transcript_id is None:
                     last_transcript_id = tid
                 if m.get("is_bus") and m.get("bus_id", 0) > 0 and last_bus_id is None:
                     last_bus_id = m["bus_id"]
                 if last_transcript_id is not None and last_bus_id is not None:
                     break
+            last_id = last_transcript_id or (-(last_bus_id or 0) if last_bus_id else None)
 
         # Cap on initial poll only
         if after == 0 and len(msgs) > limit:
@@ -547,6 +778,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         response = {
             "ok": True,
             "queued": True,
+            "streaming": True,
             "session_id": requested_sid,
         }
         self._json(200, json.dumps(response, ensure_ascii=False).encode("utf-8"))
@@ -755,6 +987,9 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   .msg.pending {
     border-style: dashed;
     opacity: 0.78;
+  }
+  .msg.live {
+    border-color: #58a6ff;
   }
   .msg-header {
     display: flex;
@@ -1009,7 +1244,7 @@ async function poll() {
     }
 
     if (data.messages && data.messages.length > 0) {
-      appendMessages(data.messages);
+      upsertMessages(data.messages);
       // Use transcript id for incremental polling (bus ids are negative)
       if (data.last_transcript_id) lastId = data.last_transcript_id;
       else if (data.last_id && data.last_id > 0) lastId = data.last_id;
@@ -1023,14 +1258,28 @@ async function poll() {
   polling = false;
 }
 
-function appendMessages(messages) {
+function messageKey(msg) {
+  if (msg.live) return String(msg.id);
+  if (msg.is_bus) return `bus:${msg.bus_id}`;
+  return `db:${msg.id}`;
+}
+
+function upsertMessages(messages) {
   const container = document.getElementById('transcript');
   const empty = container.querySelector('.empty');
   if (empty) empty.remove();
   removeMatchedPendingMessages(messages);
 
   for (const msg of messages) {
-    container.appendChild(buildMessageElement(msg));
+    const key = messageKey(msg);
+    const existing = container.querySelector(`.msg[data-message-key="${CSS.escape(key)}"]`);
+    const next = buildMessageElement(msg);
+    next.dataset.messageKey = key;
+    if (existing) {
+      existing.replaceWith(next);
+    } else {
+      container.appendChild(next);
+    }
   }
 
   updateMessageCount();
@@ -1042,7 +1291,10 @@ function appendMessages(messages) {
 
 function buildMessageElement(msg, opts = {}) {
   const el = document.createElement('div');
-  el.className = opts.pending ? 'msg pending' : 'msg';
+  const classes = ['msg'];
+  if (opts.pending || (msg.live && !msg.completed)) classes.push('pending');
+  if (msg.live) classes.push('live');
+  el.className = classes.join(' ');
 
   const roleLabel = String(msg.display || msg.role || 'message');
   const roleClass = opts.pending ? 'pending' : roleLabel.replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
@@ -1057,7 +1309,15 @@ function buildMessageElement(msg, opts = {}) {
   role.textContent = roleLabel;
   const timeEl = document.createElement('span');
   timeEl.className = 'msg-time';
-  timeEl.textContent = opts.pending ? `${time} · queued` : time;
+  if (opts.pending) {
+    timeEl.textContent = `${time} · queued`;
+  } else if (msg.live && msg.completed) {
+    timeEl.textContent = `${time} · pending db`;
+  } else if (msg.live) {
+    timeEl.textContent = `${time} · live`;
+  } else {
+    timeEl.textContent = time;
+  }
   header.append(role, timeEl);
 
   const contentEl = document.createElement('div');
@@ -1094,7 +1354,7 @@ function addPendingMessage(content) {
 }
 
 function removeMatchedPendingMessages(messages) {
-  const pending = Array.from(document.querySelectorAll('#transcript .msg.pending'));
+  const pending = Array.from(document.querySelectorAll('#transcript .msg[data-pending-content]'));
   if (pending.length === 0) return;
 
   for (const msg of messages) {
@@ -1149,7 +1409,7 @@ async function sendToHermes() {
       throw new Error(data.error || `Send failed: ${response.status}`);
     }
     textarea.value = '';
-    setSendStatus('Queued', 'ok');
+    setSendStatus(data.streaming ? 'Queued · streaming' : 'Queued', 'ok');
     if (data.session_id && data.session_id !== sessionId) {
       sessionId = data.session_id;
       lastId = 0;
