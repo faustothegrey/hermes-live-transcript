@@ -752,6 +752,10 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     font-size: 14px;
     line-height: 1.5;
   }
+  .msg.pending {
+    border-style: dashed;
+    opacity: 0.78;
+  }
   .msg-header {
     display: flex;
     align-items: center;
@@ -774,6 +778,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   .msg-role.codex { background: var(--codex); color: #0d1117; }
   .msg-role.gemini { background: var(--gemini); color: #0d1117; }
   .msg-role.agy { background: var(--gemini); color: #0d1117; }
+  .msg-role.pending { background: var(--muted); color: #0d1117; }
   .msg-time { color: var(--muted); font-size: 11px; }
   .msg-content {
     white-space: pre-wrap;
@@ -938,11 +943,18 @@ function toggleScroll() {
 
 const MAX_VISIBLE = 60;
 
+function updateMessageCount() {
+  const container = document.getElementById('transcript');
+  const count = container.querySelectorAll('.msg').length;
+  document.getElementById('msg-count').textContent = count + ' messages';
+}
+
 function trimTranscript() {
   const container = document.getElementById('transcript');
   while (container.children.length > MAX_VISIBLE + 5) {
     container.removeChild(container.firstChild);
   }
+  updateMessageCount();
 }
 
 async function poll() {
@@ -1015,47 +1027,87 @@ function appendMessages(messages) {
   const container = document.getElementById('transcript');
   const empty = container.querySelector('.empty');
   if (empty) empty.remove();
+  removeMatchedPendingMessages(messages);
 
   for (const msg of messages) {
-    const el = document.createElement('div');
-    el.className = 'msg';
-
-    const roleLabel = String(msg.display || msg.role || 'message');
-    const roleClass = roleLabel.replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
-    const time = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString() : '';
-    const content = String(msg.content || '');
-
-    const needsCollapse = content.length > 500;
-    const header = document.createElement('div');
-    header.className = 'msg-header';
-    const role = document.createElement('span');
-    role.className = `msg-role ${roleClass}`;
-    role.textContent = roleLabel;
-    const timeEl = document.createElement('span');
-    timeEl.className = 'msg-time';
-    timeEl.textContent = time;
-    header.append(role, timeEl);
-
-    const contentEl = document.createElement('div');
-    contentEl.className = `msg-content ${needsCollapse ? 'collapsed' : ''}`;
-    contentEl.textContent = content;
-    contentEl.addEventListener('click', () => contentEl.classList.toggle('collapsed'));
-
-    el.append(header, contentEl);
-    if (msg.tool_name) {
-      const toolInfo = document.createElement('div');
-      toolInfo.className = 'tool-detail';
-      toolInfo.textContent = String(msg.tool_name);
-      el.appendChild(toolInfo);
-    }
-    container.appendChild(el);
+    container.appendChild(buildMessageElement(msg));
   }
 
-  const count = container.children.length;
-  document.getElementById('msg-count').textContent = count + ' messages';
+  updateMessageCount();
 
   if (autoScroll) {
     window.scrollTo(0, 0);
+  }
+}
+
+function buildMessageElement(msg, opts = {}) {
+  const el = document.createElement('div');
+  el.className = opts.pending ? 'msg pending' : 'msg';
+
+  const roleLabel = String(msg.display || msg.role || 'message');
+  const roleClass = opts.pending ? 'pending' : roleLabel.replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
+  const time = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString() : '';
+  const content = String(msg.content || '');
+
+  const needsCollapse = content.length > 500;
+  const header = document.createElement('div');
+  header.className = 'msg-header';
+  const role = document.createElement('span');
+  role.className = `msg-role ${roleClass}`;
+  role.textContent = roleLabel;
+  const timeEl = document.createElement('span');
+  timeEl.className = 'msg-time';
+  timeEl.textContent = opts.pending ? `${time} · queued` : time;
+  header.append(role, timeEl);
+
+  const contentEl = document.createElement('div');
+  contentEl.className = `msg-content ${needsCollapse ? 'collapsed' : ''}`;
+  contentEl.textContent = content;
+  contentEl.addEventListener('click', () => contentEl.classList.toggle('collapsed'));
+
+  el.append(header, contentEl);
+  if (msg.tool_name || opts.detail) {
+    const toolInfo = document.createElement('div');
+    toolInfo.className = 'tool-detail';
+    toolInfo.textContent = String(msg.tool_name || opts.detail);
+    el.appendChild(toolInfo);
+  }
+  return el;
+}
+
+function addPendingMessage(content) {
+  const container = document.getElementById('transcript');
+  const empty = container.querySelector('.empty');
+  if (empty) empty.remove();
+
+  const el = buildMessageElement({
+    display: 'human',
+    content,
+    timestamp: Date.now() / 1000
+  }, {pending: true, detail: 'waiting for Hermes to persist this turn'});
+  el.dataset.pendingContent = content;
+  container.appendChild(el);
+  updateMessageCount();
+  if (autoScroll) {
+    window.scrollTo(0, 0);
+  }
+}
+
+function removeMatchedPendingMessages(messages) {
+  const pending = Array.from(document.querySelectorAll('#transcript .msg.pending'));
+  if (pending.length === 0) return;
+
+  for (const msg of messages) {
+    const role = String(msg.role || '').toLowerCase();
+    const display = String(msg.display || '').toLowerCase();
+    if (role !== 'user' && display !== 'human') continue;
+
+    const content = String(msg.content || '');
+    const match = pending.find(el => el.dataset.pendingContent === content);
+    if (match) {
+      match.remove();
+      pending.splice(pending.indexOf(match), 1);
+    }
   }
 }
 
@@ -1106,6 +1158,7 @@ async function sendToHermes() {
       document.getElementById('transcript').innerHTML = '';
       document.getElementById('msg-count').textContent = '0 messages';
     }
+    addPendingMessage(message);
     poll();
   } catch (e) {
     setSendStatus(e.message || 'Send failed', 'error');
