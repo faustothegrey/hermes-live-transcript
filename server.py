@@ -71,6 +71,26 @@ def normalize_message_content(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def message_content_matches(live_content: object, committed_content: object, live_completed: bool = False) -> bool:
+    live = normalize_message_content(live_content)
+    committed = normalize_message_content(committed_content)
+    if not live or not committed:
+        return False
+    if live == committed:
+        return True
+
+    shorter = min(len(live), len(committed))
+    longer = max(len(live), len(committed))
+    if shorter < 24:
+        return False
+
+    if committed.startswith(live):
+        return not live_completed or len(live) >= 48 or shorter / longer >= 0.65
+    if live.startswith(committed):
+        return shorter / longer >= 0.65
+    return False
+
+
 def archive_timestamp(value: object) -> float | None:
     try:
         ts = float(value)
@@ -282,8 +302,7 @@ def reconcile_live_messages_locked(session_id: str, committed_messages: list[dic
 
     matched_keys = []
     for key, live in session_messages.items():
-        live_content = normalize_message_content(live.get("content"))
-        if not live_content:
+        if not normalize_message_content(live.get("content")):
             continue
         live_role = str(live.get("role") or "").lower()
         live_display = str(live.get("display") or "").lower()
@@ -297,10 +316,7 @@ def reconcile_live_messages_locked(session_id: str, committed_messages: list[dic
             )
             if not same_role:
                 continue
-            if content == live_content:
-                matched_keys.append(key)
-                break
-            if not live_completed and len(live_content) >= 24 and content.startswith(live_content):
+            if message_content_matches(live.get("content"), content, live_completed):
                 matched_keys.append(key)
                 break
 
@@ -1420,11 +1436,64 @@ function messageKey(msg) {
   return `db:${msg.id}`;
 }
 
+function normalizedContent(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function messageContentMatches(liveContent, committedContent, liveCompleted = false) {
+  const live = normalizedContent(liveContent);
+  const committed = normalizedContent(committedContent);
+  if (!live || !committed) return false;
+  if (live === committed) return true;
+
+  const shorter = Math.min(live.length, committed.length);
+  const longer = Math.max(live.length, committed.length);
+  if (shorter < 24) return false;
+
+  if (committed.startsWith(live)) {
+    return !liveCompleted || live.length >= 48 || shorter / longer >= 0.65;
+  }
+  if (live.startsWith(committed)) {
+    return shorter / longer >= 0.65;
+  }
+  return false;
+}
+
+function sameConversationRole(a, b) {
+  const roleA = String(a.role || '').toLowerCase();
+  const roleB = String(b.role || '').toLowerCase();
+  const displayA = String(a.display || '').toLowerCase();
+  const displayB = String(b.display || '').toLowerCase();
+  return (
+    roleA === roleB ||
+    displayA === displayB ||
+    (roleA === 'assistant' && displayB === 'hermes') ||
+    (roleB === 'assistant' && displayA === 'hermes') ||
+    (roleA === 'user' && displayB === 'human') ||
+    (roleB === 'user' && displayA === 'human')
+  );
+}
+
+function filterReconciledLiveMessages(messages) {
+  const committed = messages.filter(msg => !msg.live && !msg.is_bus);
+  if (committed.length === 0) return messages;
+
+  return messages.filter(msg => {
+    if (!msg.live) return true;
+    return !committed.some(dbMsg =>
+      sameConversationRole(msg, dbMsg) &&
+      messageContentMatches(msg.content, dbMsg.content, Boolean(msg.completed))
+    );
+  });
+}
+
 function upsertMessages(messages) {
+  messages = filterReconciledLiveMessages(messages);
   const container = document.getElementById('transcript');
   const empty = container.querySelector('.empty');
   if (empty) empty.remove();
   removeMatchedPendingMessages(messages);
+  removeMatchedLiveMessages(messages);
 
   for (const msg of messages) {
     const key = messageKey(msg);
@@ -1463,6 +1532,7 @@ function buildMessageElement(msg, opts = {}) {
   el.dataset.timestamp = msg.timestamp == null ? '' : String(msg.timestamp);
   el.dataset.content = content;
   if (msg.live) el.dataset.live = '1';
+  if (msg.completed) el.dataset.completed = '1';
   if (opts.pending) el.dataset.pending = '1';
 
   const needsCollapse = content.length > 500;
@@ -1531,6 +1601,28 @@ function removeMatchedPendingMessages(messages) {
     if (match) {
       match.remove();
       pending.splice(pending.indexOf(match), 1);
+    }
+  }
+}
+
+function removeMatchedLiveMessages(messages) {
+  const liveNodes = Array.from(document.querySelectorAll('#transcript .msg[data-live="1"]'));
+  if (liveNodes.length === 0) return;
+
+  for (const msg of messages) {
+    if (msg.live || msg.is_bus) continue;
+
+    const match = liveNodes.find(el => sameConversationRole({
+      role: el.dataset.role || '',
+      display: el.dataset.display || ''
+    }, msg) && messageContentMatches(
+      el.dataset.content || '',
+      msg.content || '',
+      el.dataset.completed === '1'
+    ));
+    if (match) {
+      match.remove();
+      liveNodes.splice(liveNodes.indexOf(match), 1);
     }
   }
 }
