@@ -21,6 +21,7 @@ Utile per:
 │  GET  /api/current?after=N&bus_after=M&session_id= │
 │  GET  /api/bus/status                              │
 │  POST /api/send                                    │
+│  POST /api/archive                                 │
 └───────────────────────┬────────────────────────────┘
                         │ HTTP locale
 ┌───────────────────────▼────────────────────────────┐
@@ -32,6 +33,7 @@ Utile per:
 │  GET  /api/status       sessione corrente          │
 │  GET  /api/bus/status   liveness agenti            │
 │  POST /api/send         proxy verso Hermes API     │
+│  POST /api/archive      salva Markdown locale      │
 └───────────────┬───────────────────┬────────────────┘
                 │                   │
                 ▼                   ▼
@@ -59,6 +61,7 @@ Utile per:
 | API key Hermes | vedi sotto | Letta solo lato server; non viene inserita nell'HTML servito al browser. |
 | LaunchAgent plist | `~/Library/LaunchAgents/com.fausto.hermes-live-transcript.plist` | Configurazione launchd installata. Il file nel repo è la copia sorgente. |
 | Log servizio | `~/.hermes/logs/live-transcript.log` | stdout/stderr del processo launchd. |
+| Archivio transcript visibili | `~/.hermes/live-transcript-archives/` | Creato dal pulsante **Archive** o da `POST /api/archive`. Salva Markdown leggibile. |
 | Archivio sessioni | `~/.hermes/archived/` | Creato da `archive-old-sessions.py`. |
 
 Ordine effettivo di lookup della API key:
@@ -195,6 +198,37 @@ Comportamento effettivo:
 
 Nota: la UI attuale richiede una `sessionId` gia caricata prima di chiamare `/api/send`, quindi la creazione automatica di sessione e soprattutto utile per chiamate API dirette o sessioni concluse.
 
+### `POST /api/archive`
+
+Salva su file i messaggi attualmente visibili nella UI. Questo endpoint non rilegge `state.db`: riceve dal browser la lista dei nodi `.msg` presenti nel DOM, quindi puo includere anche messaggi live o pending non ancora persistiti da Hermes.
+
+Body:
+
+```json
+{
+  "session_id": "20260629_065835_af2696",
+  "filename": "hermes-transcript_20260629.md",
+  "messages": [
+    {
+      "id": 7125,
+      "role": "assistant",
+      "display": "hermes",
+      "content": "...",
+      "timestamp": 1782710123.45
+    }
+  ]
+}
+```
+
+Comportamento:
+
+- scrive un file Markdown in `~/.hermes/live-transcript-archives/`
+- sanitizza il nome file e aggiunge `.md` se manca
+- se il file esiste gia, aggiunge un suffisso con archive id
+- limita il body a 1 MiB e i messaggi a 200
+- include nel titolo dell'archivio timestamp del primo e ultimo messaggio e `session_id`
+- risponde con path, filename, archive id e numero messaggi salvati
+
 ## UI / comportamento
 
 - Poll automatico del transcript: 3s default, 1s con `--dev`
@@ -204,6 +238,7 @@ Nota: la UI attuale richiede una `sessionId` gia caricata prima di chiamare `/ap
 - Collasso automatico del contenuto oltre 500 caratteri; click sul contenuto per espandere o richiudere
 - Pulsante **Auto-scroll** per saltare in cima quando arrivano nuovi messaggi
 - Pulsante **Clear** che svuota solo il DOM locale; non cancella dati dai DB
+- Pulsante **Archive** che chiede un nome file e salva i messaggi attualmente visibili in `~/.hermes/live-transcript-archives/`
 - Sidebar **Send to Hermes** con invio via pulsante o `Cmd/Ctrl+Enter`
 - Messaggio pending locale dopo l'invio, rimosso quando il corrispondente messaggio `human` compare in `state.db`
 - Badge agenti con pallino verde/rosso; hover sui badge con sessione tmux per mostrare il comando, click per copiarlo
@@ -278,11 +313,11 @@ La UI puo mostrare solo cio che Hermes ha gia persistito in `state.db`. Se Herme
 
 ### Session switching
 
-Il primo poll sceglie la sessione non-cron piu recente iniziata oggi. Dopo il caricamento, client e server usano una sessione pinnata tramite `session_id`, quindi i poll incrementali non dovrebbero saltare a una nuova sessione. Un hard refresh riparte pero dalla sessione piu recente di oggi.
+Il primo poll sceglie la sessione non-cron piu recente iniziata oggi. Dopo il caricamento, client e server usano una sessione pinnata tramite `session_id`, quindi i poll incrementali non dovrebbero saltare a una nuova sessione. Un hard refresh o un restart del servizio riparte pero dalla sessione piu recente di oggi; se quella sessione ha solo due messaggi, la UI mostrera solo quei due anche se esistono sessioni precedenti piu lunghe.
 
 ### Cache HTML/JS
 
-Le modifiche all'HTML/JS inline in `server.py` possono richiedere hard refresh del browser (`Cmd+Shift+R`). Le API JSON restano fresche perche vengono interrogate a ogni poll.
+Le modifiche all'HTML/JS inline in `server.py` richiedono restart del processo server e hard refresh del browser (`Cmd+Shift+R`). Un hard refresh da solo ricarica solo cio che il processo gia in esecuzione sta servendo. Le API JSON restano fresche perche vengono interrogate a ogni poll.
 
 ### Dipendenze esterne opzionali
 
