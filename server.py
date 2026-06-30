@@ -27,11 +27,14 @@ import urllib.request
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8800
 STATE_DB = Path.home() / ".hermes" / "state.db"
 BUS_LOG_DB = Path.home() / ".hermes" / "agent-bus-log.db"
+ARCHIVE_DIR = Path.home() / ".hermes" / "live-transcript-archives"
 HERMES_API_BASE_URL = os.getenv("HERMES_API_BASE_URL", "http://127.0.0.1:8642")
 HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
 HERMES_CONFIG_FILE = Path.home() / ".hermes" / "config.yaml"
 HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
 MAX_SEND_CHARS = 20000
+MAX_ARCHIVE_MESSAGES = 200
+MAX_ARCHIVE_BODY_BYTES = 1024 * 1024
 LIVE_MESSAGE_TTL_SECONDS = 20 * 60
 MAX_LIVE_MESSAGES_PER_SESSION = 20
 
@@ -66,6 +69,132 @@ def log_exception(context: str):
 
 def normalize_message_content(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def archive_timestamp(value: object) -> float | None:
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    return ts
+
+
+def format_archive_timestamp(value: object, for_filename: bool = False) -> str:
+    ts = archive_timestamp(value)
+    if ts is None:
+        return "unknown"
+    dt = datetime.fromtimestamp(ts).astimezone()
+    if for_filename:
+        return dt.strftime("%Y%m%d-%H%M%S")
+    return dt.isoformat(timespec="seconds")
+
+
+def safe_archive_filename(value: object) -> str:
+    name = str(value or "").strip()
+    name = name.replace("/", "-").replace("\\", "-")
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "-", name)
+    name = re.sub(r"\s+", " ", name).strip(" .-_")
+    if not name:
+        name = "hermes-transcript-archive"
+    if not name.lower().endswith(".md"):
+        name = f"{name}.md"
+    return name[:180]
+
+
+def render_archive_markdown(archive_id: str, session_id: str, messages: list[dict]) -> str:
+    first_ts = messages[0].get("timestamp") if messages else None
+    last_ts = messages[-1].get("timestamp") if messages else None
+    title = (
+        f"Hermes transcript archive "
+        f"{format_archive_timestamp(first_ts)} to {format_archive_timestamp(last_ts)}"
+    )
+    if session_id:
+        title += f" ({session_id})"
+
+    lines = [
+        f"# {title}",
+        "",
+        f"- Archive id: `{archive_id}`",
+        f"- Session id: `{session_id or 'unknown'}`",
+        f"- First message: `{format_archive_timestamp(first_ts)}`",
+        f"- Last message: `{format_archive_timestamp(last_ts)}`",
+        f"- Message count: `{len(messages)}`",
+        f"- Created at: `{datetime.now().astimezone().isoformat(timespec='seconds')}`",
+        "",
+        "## Messages",
+        "",
+    ]
+
+    for msg in messages:
+        display = str(msg.get("display") or msg.get("role") or "message")
+        timestamp = format_archive_timestamp(msg.get("timestamp"))
+        message_id = str(msg.get("id") or msg.get("bus_id") or "")
+        status = []
+        if msg.get("live"):
+            status.append("live")
+        if msg.get("pending"):
+            status.append("pending")
+        suffix = f" [{' / '.join(status)}]" if status else ""
+        id_part = f" `{message_id}`" if message_id else ""
+        lines.extend([
+            f"### {display}{suffix} - {timestamp}{id_part}",
+            "",
+            "```text",
+            str(msg.get("content") or ""),
+            "```",
+            "",
+        ])
+    return "\n".join(lines)
+
+
+def archive_visible_messages(data: dict) -> dict:
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("no messages to archive")
+    if len(messages) > MAX_ARCHIVE_MESSAGES:
+        raise ValueError(f"too many messages to archive; max {MAX_ARCHIVE_MESSAGES}")
+
+    cleaned = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "")
+        if not content:
+            continue
+        cleaned.append({
+            "id": item.get("id"),
+            "bus_id": item.get("bus_id"),
+            "role": str(item.get("role") or ""),
+            "display": str(item.get("display") or item.get("role") or "message"),
+            "content": content[:MAX_SEND_CHARS],
+            "timestamp": archive_timestamp(item.get("timestamp")),
+            "live": bool(item.get("live")),
+            "pending": bool(item.get("pending")),
+        })
+    if not cleaned:
+        raise ValueError("no non-empty messages to archive")
+
+    session_id = str(data.get("session_id") or "")
+    archive_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    filename = safe_archive_filename(data.get("filename"))
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    path = ARCHIVE_DIR / filename
+    if path.exists():
+        stem = path.stem
+        suffix = path.suffix or ".md"
+        path = ARCHIVE_DIR / f"{stem}-{archive_id}{suffix}"
+
+    content = render_archive_markdown(archive_id, session_id, cleaned)
+    path.write_text(content, encoding="utf-8")
+    return {
+        "archive_id": archive_id,
+        "path": str(path),
+        "filename": path.name,
+        "message_count": len(cleaned),
+    }
 
 
 def prune_live_messages_locked(now: float | None = None):
@@ -596,13 +725,15 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 
         if path == "/api/send":
             self._serve_send()
+        elif path == "/api/archive":
+            self._serve_archive()
         else:
             self._json(404, json.dumps({"error": "not found"}).encode("utf-8"))
 
     def do_HEAD(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if path in ("/", "/api/status", "/api/current", "/api/bus/status"):
+        if path in ("/", "/api/status", "/api/current", "/api/bus/status", "/api/archive"):
             self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -782,6 +913,22 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             "session_id": requested_sid,
         }
         self._json(200, json.dumps(response, ensure_ascii=False).encode("utf-8"))
+
+    def _serve_archive(self):
+        data = self._read_json_body(max_bytes=MAX_ARCHIVE_BODY_BYTES)
+        if data is None:
+            return
+        try:
+            result = archive_visible_messages(data)
+        except ValueError as exc:
+            self._json(400, json.dumps({"error": str(exc)}).encode("utf-8"))
+            return
+        except Exception:
+            log_exception("failed to archive visible messages")
+            self._json(500, json.dumps({"error": "failed to archive messages"}).encode("utf-8"))
+            return
+        body = json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8")
+        self._json(200, body)
 
     def _serve_status(self):
         sid = get_current_session_id()
@@ -971,6 +1118,13 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     margin-left: auto;
     align-self: center;
   }
+  #archive-status {
+    color: var(--muted);
+    font-size: 12px;
+    align-self: center;
+  }
+  #archive-status.ok { color: #3fb950; }
+  #archive-status.error { color: #ff7b72; }
   #transcript {
     display: flex;
     flex-direction: column-reverse;
@@ -1145,6 +1299,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     <div class="controls">
       <button id="btn-scroll" class="active" onclick="toggleScroll()">Auto-scroll</button>
       <button onclick="clearTranscript()">Clear</button>
+      <button id="btn-archive" onclick="archiveTranscript()">Archive</button>
+      <span id="archive-status"></span>
       <span id="msg-count">0 messages</span>
     </div>
 
@@ -1300,6 +1456,14 @@ function buildMessageElement(msg, opts = {}) {
   const roleClass = opts.pending ? 'pending' : roleLabel.replace(/[^a-z0-9_-]/gi, '-').toLowerCase();
   const time = msg.timestamp ? new Date(msg.timestamp * 1000).toLocaleTimeString() : '';
   const content = String(msg.content || '');
+  el.dataset.messageId = msg.id == null ? '' : String(msg.id);
+  el.dataset.busId = msg.bus_id == null ? '' : String(msg.bus_id);
+  el.dataset.role = String(msg.role || '');
+  el.dataset.display = roleLabel;
+  el.dataset.timestamp = msg.timestamp == null ? '' : String(msg.timestamp);
+  el.dataset.content = content;
+  if (msg.live) el.dataset.live = '1';
+  if (opts.pending) el.dataset.pending = '1';
 
   const needsCollapse = content.length > 500;
   const header = document.createElement('div');
@@ -1374,6 +1538,90 @@ function removeMatchedPendingMessages(messages) {
 function clearTranscript() {
   document.getElementById('transcript').innerHTML = '<div class="empty">Cleared — waiting for new messages...</div>';
   document.getElementById('msg-count').textContent = '0 messages';
+  setArchiveStatus('', '');
+}
+
+function setArchiveStatus(text, state) {
+  const el = document.getElementById('archive-status');
+  el.textContent = text;
+  el.className = state || '';
+}
+
+function archiveFilenamePart(value) {
+  return String(value || 'unknown')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'unknown';
+}
+
+function archiveDatePart(timestamp) {
+  const date = timestamp ? new Date(Number(timestamp) * 1000) : null;
+  if (!date || Number.isNaN(date.getTime())) return 'unknown';
+  const pad = value => String(value).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate())
+  ].join('') + '-' + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join('');
+}
+
+function visibleArchiveMessages() {
+  return Array.from(document.querySelectorAll('#transcript .msg')).map(el => ({
+    id: el.dataset.messageId || undefined,
+    bus_id: el.dataset.busId || undefined,
+    role: el.dataset.role || '',
+    display: el.dataset.display || 'message',
+    content: el.dataset.content || '',
+    timestamp: el.dataset.timestamp ? Number(el.dataset.timestamp) : undefined,
+    live: el.dataset.live === '1',
+    pending: el.dataset.pending === '1'
+  })).filter(msg => msg.content.trim());
+}
+
+function defaultArchiveFilename(messages) {
+  const first = messages[0] || {};
+  const last = messages[messages.length - 1] || {};
+  return [
+    'hermes-transcript',
+    archiveFilenamePart(sessionId || 'no-session'),
+    archiveDatePart(first.timestamp),
+    archiveDatePart(last.timestamp)
+  ].join('_') + '.md';
+}
+
+async function archiveTranscript() {
+  const messages = visibleArchiveMessages();
+  if (messages.length === 0) {
+    setArchiveStatus('Nothing to archive', 'error');
+    return;
+  }
+
+  const suggested = defaultArchiveFilename(messages);
+  const filename = window.prompt('Archive filename', suggested);
+  if (filename === null) return;
+  const button = document.getElementById('btn-archive');
+  button.disabled = true;
+  setArchiveStatus('Archiving...', '');
+  try {
+    const response = await fetch('/api/archive', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: sessionId, filename, messages})
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || `Archive failed: ${response.status}`);
+    }
+    setArchiveStatus(`Saved ${data.message_count} to ${data.filename}`, 'ok');
+  } catch (e) {
+    setArchiveStatus(e.message || 'Archive failed', 'error');
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function setSendStatus(text, state) {
