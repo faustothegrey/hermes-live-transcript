@@ -58,6 +58,7 @@ Utile per:
 | Agent sessions | `~/.hermes/agent-sessions.json` | Opzionale. Usato per mostrare il comando `tmux attach` nei badge agenti. |
 | Agent Telemetry | `http://127.0.0.1:9900/agents` | Sorgente di liveness per `/api/bus/status`. Se non risponde, la barra agenti resta vuota. |
 | Hermes API base URL | `HERMES_API_BASE_URL` o `http://127.0.0.1:8642` | Endpoint usato dal proxy `/api/send`. |
+| Progetto corrente | `HERMES_LIVE_PROJECT_NAME`, `HERMES_LIVE_PROJECT_PATH` | Metadati del progetto di sviluppo passati a Hermes quando la UI crea una nuova sessione. Include i linchpin docs `AGENT.md` e `design/collaboration-workflow.md`. |
 | API key Hermes | vedi sotto | Letta solo lato server; non viene inserita nell'HTML servito al browser. |
 | LaunchAgent plist | `~/Library/LaunchAgents/com.fausto.hermes-live-transcript.plist` | Configurazione launchd installata. Il file nel repo è la copia sorgente. |
 | Log servizio | `~/.hermes/logs/live-transcript.log` | stdout/stderr del processo launchd. |
@@ -192,11 +193,12 @@ Comportamento effettivo:
 - rifiuta body vuoti, JSON non oggetto, messaggi non stringa e messaggi oltre 20.000 caratteri
 - usa `session_id`, poi la sessione pinnata, poi la sessione corrente di oggi
 - se la sessione indicata non esiste, risponde `404`
-- se non c'e una sessione valida o quella trovata e conclusa, crea una nuova sessione Hermes con titolo `Live Transcript Input`
-- inoltra il messaggio a `POST {HERMES_API_BASE_URL}/api/sessions/{session_id}/chat`
+- se non c'e una sessione valida o quella trovata e conclusa, crea una nuova sessione Hermes con titolo `<project-name> - YYYY-MM-DD HH:MM:SS`
+- passa a Hermes nome e path del progetto tramite `system_prompt` della sessione e `instructions` del primo turno
+- inoltra il messaggio a `POST {HERMES_API_BASE_URL}/api/sessions/{session_id}/chat/stream`
 - risponde subito con `{"ok": true, "queued": true, "session_id": "..."}` e invia a Hermes in un thread background
 
-Nota: la UI attuale richiede una `sessionId` gia caricata prima di chiamare `/api/send`, quindi la creazione automatica di sessione e soprattutto utile per chiamate API dirette o sessioni concluse.
+Nota: se la UI non ha una `sessionId` attiva, chiama comunque `/api/send`; il server crea una nuova sessione Hermes e restituisce il nuovo `session_id`.
 
 ### `POST /api/archive`
 
@@ -207,7 +209,7 @@ Body:
 ```json
 {
   "session_id": "20260629_065835_af2696",
-  "filename": "hermes-transcript_20260629.md",
+  "filename": "hermes-live-transcript - 2026-07-01 06-15-00.md",
   "messages": [
     {
       "id": 7125,
@@ -224,9 +226,10 @@ Comportamento:
 
 - scrive un file Markdown in `~/.hermes/live-transcript-archives/`
 - sanitizza il nome file e aggiunge `.md` se manca
+- se il browser non passa un nome file, usa `<project-name> - YYYY-MM-DD HH-MM-SS.md`
 - se il file esiste gia, aggiunge un suffisso con archive id
 - limita il body a 1 MiB e i messaggi a 200
-- include nel titolo dell'archivio timestamp del primo e ultimo messaggio e `session_id`
+- include nell'archivio `session_id`, nome progetto, path progetto, timestamp del primo e ultimo messaggio
 - risponde con path, filename, archive id e numero messaggi salvati
 
 ## UI / comportamento
@@ -239,7 +242,7 @@ Comportamento:
 - Pulsante **Auto-scroll** per saltare in cima quando arrivano nuovi messaggi
 - Pulsante **Clear** che svuota solo il DOM locale; non cancella dati dai DB
 - Pulsante **Archive** che chiede un nome file e salva i messaggi attualmente visibili in `~/.hermes/live-transcript-archives/`
-- Sidebar **Send to Hermes** con invio via pulsante o `Cmd/Ctrl+Enter`
+- Sidebar **Send to Hermes** con **Send** o `Cmd/Ctrl+Enter` per inviare il testo cosi com'e; **Start** sta a destra di Send, aggiunge i metadati del progetto al messaggio, ed e disabilitato dopo l'avvio della sessione
 - Messaggio pending locale dopo l'invio, rimosso quando il corrispondente messaggio `human` compare in `state.db`
 - Badge agenti con pallino verde/rosso; hover sui badge con sessione tmux per mostrare il comando, click per copiarlo
 

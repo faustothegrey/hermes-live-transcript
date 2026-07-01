@@ -32,11 +32,25 @@ HERMES_API_BASE_URL = os.getenv("HERMES_API_BASE_URL", "http://127.0.0.1:8642")
 HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
 HERMES_CONFIG_FILE = Path.home() / ".hermes" / "config.yaml"
 HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
+PROJECT_PATH = Path(os.getenv("HERMES_LIVE_PROJECT_PATH") or os.getenv("HERMES_PROJECT_PATH") or Path.cwd()).expanduser().resolve()
+PROJECT_NAME = (
+    os.getenv("HERMES_LIVE_PROJECT_NAME")
+    or os.getenv("HERMES_PROJECT_NAME")
+    or PROJECT_PATH.name
+    or "project"
+).strip()
+if not PROJECT_NAME:
+    PROJECT_NAME = "project"
+LINCHPIN_DOCS = [
+    "AGENT.md",
+    "design/collaboration-workflow.md",
+]
 MAX_SEND_CHARS = 20000
 MAX_ARCHIVE_MESSAGES = 200
 MAX_ARCHIVE_BODY_BYTES = 1024 * 1024
 LIVE_MESSAGE_TTL_SECONDS = 20 * 60
 MAX_LIVE_MESSAGES_PER_SESSION = 20
+MAX_SESSION_TITLE_LENGTH = 100
 
 # Dev mode: shorter poll, verbose logging
 DEV_MODE = "--dev" in sys.argv
@@ -111,6 +125,36 @@ def format_archive_timestamp(value: object, for_filename: bool = False) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+def human_timestamp(dt: datetime | None = None) -> str:
+    return (dt or datetime.now().astimezone()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def compact_project_name(max_len: int) -> str:
+    name = re.sub(r"\s+", " ", PROJECT_NAME).strip() or "project"
+    if len(name) <= max_len:
+        return name
+    return name[:max_len].rstrip(" .-_") or "project"
+
+
+def project_session_title(dt: datetime | None = None) -> str:
+    stamp = human_timestamp(dt)
+    separator = " - "
+    max_name_len = MAX_SESSION_TITLE_LENGTH - len(separator) - len(stamp)
+    return f"{compact_project_name(max_name_len)}{separator}{stamp}"
+
+
+def project_context_prompt() -> str:
+    docs = "\n".join(f"- {doc}: {PROJECT_PATH / doc}" for doc in LINCHPIN_DOCS)
+    return (
+        "Current development project context:\n"
+        f"- Project name: {PROJECT_NAME}\n"
+        f"- Project path: {PROJECT_PATH}\n"
+        "- Linchpin docs to read at startup:\n"
+        f"{docs}\n\n"
+        "Use this as the working project context for this development session."
+    )
+
+
 def safe_archive_filename(value: object) -> str:
     name = str(value or "").strip()
     name = name.replace("/", "-").replace("\\", "-")
@@ -121,6 +165,10 @@ def safe_archive_filename(value: object) -> str:
     if not name.lower().endswith(".md"):
         name = f"{name}.md"
     return name[:180]
+
+
+def default_archive_filename(dt: datetime | None = None) -> str:
+    return safe_archive_filename(project_session_title(dt))
 
 
 def render_archive_markdown(archive_id: str, session_id: str, messages: list[dict]) -> str:
@@ -138,6 +186,9 @@ def render_archive_markdown(archive_id: str, session_id: str, messages: list[dic
         "",
         f"- Archive id: `{archive_id}`",
         f"- Session id: `{session_id or 'unknown'}`",
+        f"- Project name: `{PROJECT_NAME}`",
+        f"- Project path: `{PROJECT_PATH}`",
+        f"- Linchpin docs: `{', '.join(LINCHPIN_DOCS)}`",
         f"- First message: `{format_archive_timestamp(first_ts)}`",
         f"- Last message: `{format_archive_timestamp(last_ts)}`",
         f"- Message count: `{len(messages)}`",
@@ -198,7 +249,7 @@ def archive_visible_messages(data: dict) -> dict:
 
     session_id = str(data.get("session_id") or "")
     archive_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-    filename = safe_archive_filename(data.get("filename"))
+    filename = safe_archive_filename(data.get("filename") or default_archive_filename())
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
     path = ARCHIVE_DIR / filename
@@ -489,17 +540,25 @@ def call_hermes_api(path: str, payload: dict, method: str = "POST", timeout: int
         return json.loads(response.read().decode("utf-8"))
 
 
-def create_hermes_api_session() -> str:
-    result = call_hermes_api("/api/sessions", {"title": "Live Transcript Input"}, timeout=30)
+def create_hermes_api_session() -> tuple[str, str]:
+    title = project_session_title()
+    result = call_hermes_api(
+        "/api/sessions",
+        {"title": title, "system_prompt": project_context_prompt()},
+        timeout=30,
+    )
     session = result.get("session") if isinstance(result, dict) else None
     session_id = session.get("id") if isinstance(session, dict) else None
     if not session_id:
         raise RuntimeError("Hermes API did not return a session id")
-    return session_id
+    return session_id, title
 
 
-def call_hermes_session_chat(session_id: str, message: str) -> dict:
-    return call_hermes_api(f"/api/sessions/{session_id}/chat", {"message": message})
+def call_hermes_session_chat(session_id: str, message: str, instructions: str | None = None) -> dict:
+    payload = {"message": message}
+    if instructions:
+        payload["instructions"] = instructions
+    return call_hermes_api(f"/api/sessions/{session_id}/chat", payload)
 
 
 def iter_sse_events(response):
@@ -559,13 +618,16 @@ def handle_hermes_stream_event(default_session_id: str, event_name: str, payload
         return
 
 
-def call_hermes_session_chat_stream(session_id: str, message: str):
+def call_hermes_session_chat_stream(session_id: str, message: str, instructions: str | None = None):
     api_key = get_hermes_api_key()
     if not api_key:
         raise RuntimeError(f"Missing Hermes API key. Set HERMES_LIVE_TRANSCRIPT_API_KEY or create {HERMES_API_KEY_FILE}")
 
     url = f"{HERMES_API_BASE_URL.rstrip('/')}/api/sessions/{session_id}/chat/stream"
-    body = json.dumps({"message": message}, ensure_ascii=False).encode("utf-8")
+    payload = {"message": message}
+    if instructions:
+        payload["instructions"] = instructions
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
@@ -581,14 +643,14 @@ def call_hermes_session_chat_stream(session_id: str, message: str):
             handle_hermes_stream_event(session_id, event_name, payload)
 
 
-def send_hermes_session_chat_background(session_id: str, message: str):
+def send_hermes_session_chat_background(session_id: str, message: str, instructions: str | None = None):
     def worker():
         try:
-            call_hermes_session_chat_stream(session_id, message)
+            call_hermes_session_chat_stream(session_id, message, instructions=instructions)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 try:
-                    call_hermes_session_chat(session_id, message)
+                    call_hermes_session_chat(session_id, message, instructions=instructions)
                     return
                 except Exception:
                     pass
@@ -909,9 +971,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         if requested_sid and session_info is None:
             self._json(404, json.dumps({"error": "Hermes session not found"}).encode("utf-8"))
             return
+        created_session = False
+        created_session_title = None
         if not requested_sid or session_info.get("ended_at", 0):
             try:
-                requested_sid = create_hermes_api_session()
+                requested_sid, created_session_title = create_hermes_api_session()
+                created_session = True
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 self._json(exc.code, json.dumps({"error": "Hermes API could not create a session", "detail": detail}).encode("utf-8"))
@@ -921,12 +986,14 @@ class TranscriptHandler(BaseHTTPRequestHandler):
                 self._json(502, json.dumps({"error": "Hermes API server unavailable", "detail": str(exc)}).encode("utf-8"))
                 return
 
-        send_hermes_session_chat_background(requested_sid, message)
+        instructions = project_context_prompt() if created_session else None
+        send_hermes_session_chat_background(requested_sid, message, instructions=instructions)
         response = {
             "ok": True,
             "queued": True,
             "streaming": True,
             "session_id": requested_sid,
+            "session_title": created_session_title,
         }
         self._json(200, json.dumps(response, ensure_ascii=False).encode("utf-8"))
 
@@ -1107,7 +1174,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     gap: 8px;
     margin-top: 10px;
   }
-  #btn-send {
+  .send-actions button {
     background: var(--hermes);
     border: 1px solid var(--hermes);
     color: #0d1117;
@@ -1117,7 +1184,11 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     font-size: 13px;
     font-weight: 600;
   }
-  #btn-send:disabled {
+  .send-actions button.secondary {
+    background: var(--card);
+    color: var(--text);
+  }
+  .send-actions button:disabled {
     opacity: 0.6;
     cursor: wait;
   }
@@ -1230,6 +1301,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     border-radius: 6px;
     border: 1px solid var(--border);
   }
+  .session-info .session-row + .session-row { margin-top: 4px; }
+  .session-info .project-name { color: var(--text); font-weight: 600; }
   #agent-bar {
     display: flex;
     gap: 8px;
@@ -1330,6 +1403,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     <textarea id="send-message" placeholder="Type a message..."></textarea>
     <div class="send-actions">
       <button id="btn-send" onclick="sendToHermes()">Send</button>
+      <button id="btn-start" class="secondary" onclick="sendToHermes({includeProjectInfo: true})">Start</button>
       <span id="send-status">Ready</span>
     </div>
   </aside>
@@ -1342,6 +1416,46 @@ let sessionId = null;
 let autoScroll = true;
 let polling = false;
 let initialized = false;
+let currentSessionTitle = null;
+let sending = false;
+const PROJECT_NAME = __PROJECT_NAME_JSON__;
+const PROJECT_PATH = __PROJECT_PATH_JSON__;
+const LINCHPIN_DOCS = __LINCHPIN_DOCS_JSON__;
+
+function renderSessionInfo(sessionTextNodes) {
+  const info = document.getElementById('session-info');
+  const sessionRow = document.createElement('div');
+  sessionRow.className = 'session-row';
+  sessionRow.append(...sessionTextNodes);
+  const projectRow = document.createElement('div');
+  projectRow.className = 'session-row project-row';
+  const projectName = document.createElement('span');
+  projectName.className = 'project-name';
+  projectName.textContent = PROJECT_NAME || 'project';
+  const projectPath = document.createElement('code');
+  projectPath.textContent = PROJECT_PATH || 'unknown';
+  projectRow.append(
+    document.createTextNode('project: '),
+    projectName,
+    document.createTextNode(' · '),
+    projectPath
+  );
+  const docsRow = document.createElement('div');
+  docsRow.className = 'session-row project-row';
+  docsRow.append(
+    document.createTextNode('linchpin docs: '),
+    document.createTextNode(LINCHPIN_DOCS.join(', '))
+  );
+  info.replaceChildren(sessionRow, projectRow, docsRow);
+}
+
+function updateSendButtons() {
+  const sendButton = document.getElementById('btn-send');
+  const startButton = document.getElementById('btn-start');
+  if (!sendButton || !startButton) return;
+  sendButton.disabled = sending;
+  startButton.disabled = sending || Boolean(sessionId);
+}
 
 function toggleScroll() {
   autoScroll = !autoScroll;
@@ -1377,9 +1491,12 @@ async function poll() {
     const data = await r.json();
 
     if (!data.session_id) {
-      document.getElementById('session-info').textContent = 'No active session.';
+      renderSessionInfo([document.createTextNode('No active session.')]);
       document.getElementById('status-text').textContent = 'idle';
       document.getElementById('dot').className = 'dot paused';
+      sessionId = null;
+      currentSessionTitle = null;
+      updateSendButtons();
       polling = false;
       return;
     }
@@ -1393,6 +1510,7 @@ async function poll() {
       document.getElementById('msg-count').textContent = '0 messages';
       document.getElementById('dot').className = 'dot live';
       document.getElementById('status-text').textContent = 'live';
+      updateSendButtons();
     }
     document.getElementById('dot').className = 'dot live';
     document.getElementById('status-text').textContent = 'live';
@@ -1401,18 +1519,18 @@ async function poll() {
     if (data.session) {
       const s = data.session;
       const title = s.title || '(untitled)';
+      currentSessionTitle = s.title || null;
       const count = s.message_count || 0;
       const date = s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '?';
-      const info = document.getElementById('session-info');
       const titleEl = document.createElement('strong');
       titleEl.textContent = title;
       const sidEl = document.createElement('code');
       sidEl.textContent = sessionId.slice(0, 20) + '...';
-      info.replaceChildren(
+      renderSessionInfo([
         titleEl,
         document.createTextNode(` · ${count} msgs · started ${date} · `),
         sidEl
-      );
+      ]);
     }
 
     if (data.messages && data.messages.length > 0) {
@@ -1641,24 +1759,22 @@ function setArchiveStatus(text, state) {
 
 function archiveFilenamePart(value) {
   return String(value || 'unknown')
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+    .replace(/[^A-Za-z0-9._ -]+/g, '-')
+    .replace(/^[ ._-]+|[ ._-]+$/g, '')
     .slice(0, 80) || 'unknown';
 }
 
-function archiveDatePart(timestamp) {
-  const date = timestamp ? new Date(Number(timestamp) * 1000) : null;
-  if (!date || Number.isNaN(date.getTime())) return 'unknown';
+function archiveTimestampForName(date = new Date()) {
   const pad = value => String(value).padStart(2, '0');
   return [
     date.getFullYear(),
     pad(date.getMonth() + 1),
     pad(date.getDate())
-  ].join('') + '-' + [
+  ].join('-') + ' ' + [
     pad(date.getHours()),
     pad(date.getMinutes()),
     pad(date.getSeconds())
-  ].join('');
+  ].join('-');
 }
 
 function visibleArchiveMessages() {
@@ -1675,14 +1791,8 @@ function visibleArchiveMessages() {
 }
 
 function defaultArchiveFilename(messages) {
-  const first = messages[0] || {};
-  const last = messages[messages.length - 1] || {};
-  return [
-    'hermes-transcript',
-    archiveFilenamePart(sessionId || 'no-session'),
-    archiveDatePart(first.timestamp),
-    archiveDatePart(last.timestamp)
-  ].join('_') + '.md';
+  const title = currentSessionTitle || `${PROJECT_NAME || 'project'} - ${archiveTimestampForName()}`;
+  return archiveFilenamePart(title) + '.md';
 }
 
 async function archiveTranscript() {
@@ -1722,27 +1832,39 @@ function setSendStatus(text, state) {
   el.className = state || '';
 }
 
-async function sendToHermes() {
+function projectInfoMessage(message) {
+  const userMessage = message.trim() || 'Start a development session for this project.';
+  const docs = LINCHPIN_DOCS.map(doc => `- ${doc}: ${PROJECT_PATH || 'unknown'}/${doc}`);
+  return [
+    'Current development project:',
+    `- Project name: ${PROJECT_NAME || 'project'}`,
+    `- Project path: ${PROJECT_PATH || 'unknown'}`,
+    '- Linchpin docs to read at startup:',
+    ...docs,
+    '',
+    userMessage
+  ].join('\n');
+}
+
+async function sendToHermes(options = {}) {
   const textarea = document.getElementById('send-message');
-  const button = document.getElementById('btn-send');
-  const message = textarea.value.trim();
+  const rawMessage = textarea.value.trim();
+  const message = options.includeProjectInfo ? projectInfoMessage(rawMessage) : rawMessage;
   if (!message) {
     setSendStatus('Message is empty', 'error');
     textarea.focus();
     return;
   }
-  if (!sessionId) {
-    setSendStatus('No active session', 'error');
-    return;
-  }
-
-  button.disabled = true;
+  sending = true;
+  updateSendButtons();
   setSendStatus('Sending...', '');
   try {
+    const payload = {message};
+    if (sessionId) payload.session_id = sessionId;
     const response = await fetch('/api/send', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message, session_id: sessionId})
+      body: JSON.stringify(payload)
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) {
@@ -1752,18 +1874,21 @@ async function sendToHermes() {
     setSendStatus(data.streaming ? 'Queued · streaming' : 'Queued', 'ok');
     if (data.session_id && data.session_id !== sessionId) {
       sessionId = data.session_id;
+      currentSessionTitle = data.session_title || currentSessionTitle;
       lastId = 0;
       lastBusId = 0;
-      initialized = false;
+      initialized = true;
       document.getElementById('transcript').innerHTML = '';
       document.getElementById('msg-count').textContent = '0 messages';
+      updateSendButtons();
     }
     addPendingMessage(message);
     poll();
   } catch (e) {
     setSendStatus(e.message || 'Send failed', 'error');
   } finally {
-    button.disabled = false;
+    sending = false;
+    updateSendButtons();
   }
 }
 
@@ -1818,6 +1943,7 @@ tooltipEl.addEventListener('click', () => {
 });
 
 setInterval(poll, __POLL_INTERVAL__);
+updateSendButtons();
 poll();
 
 // Agent liveness bar
@@ -1876,6 +2002,9 @@ function pollAgentBar() {
 </body>
 </html>"""
         html = html.replace("__POLL_INTERVAL__", str(POLL_INTERVAL))
+        html = html.replace("__PROJECT_NAME_JSON__", json.dumps(PROJECT_NAME))
+        html = html.replace("__PROJECT_PATH_JSON__", json.dumps(str(PROJECT_PATH)))
+        html = html.replace("__LINCHPIN_DOCS_JSON__", json.dumps(LINCHPIN_DOCS))
         if DEV_MODE:
             html = html.replace("</head>",
                 "<script>console.log('[Hermes Live] DEV MODE — poll interval %sms')</script></head>" % POLL_INTERVAL)
@@ -1903,6 +2032,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", PORT), TranscriptHandler)
     print(f"Hermes Live Transcript: http://127.0.0.1:{PORT}")
     print(f"  Reading from: {STATE_DB}")
+    print(f"  Project: {PROJECT_NAME} ({PROJECT_PATH})")
     sid = get_current_session_id()
     print(f"  Today session: {sid}")
     print("  Press Ctrl+C to stop.")

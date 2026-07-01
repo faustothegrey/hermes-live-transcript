@@ -14,6 +14,10 @@
     <dict>
         <key>PATH</key>
         <string>/Users/fausto/.local/bin:/Users/fausto/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HERMES_LIVE_PROJECT_NAME</key>
+        <string>AgentTalk</string>
+        <key>HERMES_LIVE_PROJECT_PATH</key>
+        <string>/Users/fausto/Software/AgentTalk</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>/Users/fausto/Software/scripts-ai/hermes-live-transcript</string>
