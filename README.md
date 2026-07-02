@@ -61,7 +61,7 @@ Utile per:
 | Agent Telemetry | `http://127.0.0.1:9900/agents` | Sorgente di liveness per `/api/bus/status`. Se non risponde, la barra agenti resta vuota. |
 | Hermes API base URL | `HERMES_API_BASE_URL` o `http://127.0.0.1:8642` | Endpoint usato dal proxy `/api/send`. |
 | Progetto corrente | `HERMES_LIVE_PROJECT_NAME`, `HERMES_LIVE_PROJECT_PATH` | Metadati del progetto di sviluppo passati a Hermes quando la UI crea una nuova sessione. Include i linchpin docs `AGENT.md` e `design/collaboration-workflow.md`. |
-| AgentTalk API base URL | `AGENTTALK_API_BASE_URL` o `http://127.0.0.1:3000` | Endpoint usato dal proxy `/api/agenttalk/backlog` per mostrare il backlog nella UI. |
+| AgentTalk API base URL | `AGENTTALK_API_BASE_URL` o `http://127.0.0.1:3741` | Endpoint usato dal proxy `/api/agenttalk/backlog` per mostrare il backlog nella UI. |
 | API key Hermes | vedi sotto | Letta solo lato server; non viene inserita nell'HTML servito al browser. |
 | LaunchAgent plist | `~/Library/LaunchAgents/com.fausto.hermes-live-transcript.plist` | Configurazione launchd installata. Il file nel repo è la copia sorgente. |
 | Log servizio | `~/.hermes/logs/live-transcript.log` | stdout/stderr del processo launchd. |
@@ -110,7 +110,7 @@ Configurazione progetto/backlog via env:
 ```bash
 HERMES_LIVE_PROJECT_NAME=AgentTalk \
 HERMES_LIVE_PROJECT_PATH=/Users/fausto/Software/AgentTalk \
-AGENTTALK_API_BASE_URL=http://127.0.0.1:3000 \
+AGENTTALK_API_BASE_URL=http://127.0.0.1:3741 \
 python3 server.py 8800 --dev
 ```
 
@@ -260,7 +260,7 @@ Risposta tipica:
 ```json
 {
   "ok": true,
-  "agenttalk_url": "http://127.0.0.1:3000/api/backlog",
+  "agenttalk_url": "http://127.0.0.1:3741/api/backlog",
   "generatedAt": "2026-07-01T19:05:00.000Z",
   "warnings": [],
   "items": [
@@ -285,7 +285,7 @@ Errore quando AgentTalk non e disponibile:
   "ok": false,
   "error": "AgentTalk backlog API unavailable",
   "detail": "<urlopen error [Errno 61] Connection refused>",
-  "agenttalk_url": "http://127.0.0.1:3000/api/backlog"
+  "agenttalk_url": "http://127.0.0.1:3741/api/backlog"
 }
 ```
 

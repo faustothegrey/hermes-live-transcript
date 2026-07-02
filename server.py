@@ -32,7 +32,7 @@ HERMES_API_BASE_URL = os.getenv("HERMES_API_BASE_URL", "http://127.0.0.1:8642")
 HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
 HERMES_CONFIG_FILE = Path.home() / ".hermes" / "config.yaml"
 HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
-AGENTTALK_API_BASE_URL = os.getenv("AGENTTALK_API_BASE_URL", "http://127.0.0.1:3000")
+AGENTTALK_API_BASE_URL = os.getenv("AGENTTALK_API_BASE_URL", "http://127.0.0.1:3741")
 PROJECT_PATH = Path(os.getenv("HERMES_LIVE_PROJECT_PATH") or os.getenv("HERMES_PROJECT_PATH") or Path.cwd()).expanduser().resolve()
 PROJECT_NAME = (
     os.getenv("HERMES_LIVE_PROJECT_NAME")
