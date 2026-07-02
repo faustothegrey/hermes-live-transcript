@@ -1063,7 +1063,9 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         self._json(200, body)
 
     def _serve_agenttalk_backlog(self):
-        url = f"{AGENTTALK_API_BASE_URL.rstrip('/')}/api/backlog"
+        params = parse_qs(urlparse(self.path).query)
+        query = "?all=true" if params.get("all", ["false"])[0].lower() == "true" else ""
+        url = f"{AGENTTALK_API_BASE_URL.rstrip('/')}/api/backlog{query}"
         try:
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as r:
@@ -1586,6 +1588,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     <div id="view-backlog" class="view">
       <div class="controls">
         <button id="btn-backlog-refresh" onclick="pollBacklog({force: true})">Refresh</button>
+        <button id="btn-backlog-all" onclick="toggleBacklogAll()">Show all</button>
         <span id="backlog-status">Not loaded</span>
       </div>
       <div class="backlog-source">AgentTalk API: <code id="backlog-source">loading...</code></div>
@@ -1619,6 +1622,7 @@ let sending = false;
 let activeView = 'transcript';
 let backlogLoaded = false;
 let backlogPolling = false;
+let showAllBacklog = false;
 const PROJECT_NAME = __PROJECT_NAME_JSON__;
 const PROJECT_PATH = __PROJECT_PATH_JSON__;
 const LINCHPIN_DOCS = __LINCHPIN_DOCS_JSON__;
@@ -1687,14 +1691,45 @@ function backlogStatusCounts(items) {
   return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
 }
 
-function renderBacklogSummary(data) {
-  const summary = document.getElementById('backlog-summary');
+function renderBacklog(data) {
   const items = Array.isArray(data.items) ? data.items : [];
+  updateBacklogAllToggle();
+  renderBacklogSummary(data, items);
+  renderBacklogItems(items);
+}
+
+function updateBacklogAllToggle() {
+  const button = document.getElementById('btn-backlog-all');
+  if (!button) return;
+  button.className = showAllBacklog ? 'active' : '';
+  button.textContent = showAllBacklog ? 'Show active' : 'Show all';
+}
+
+function renderBacklogSummary(data, items) {
+  const summary = document.getElementById('backlog-summary');
   const nodes = [];
+  const parsedTotal = Number(data.total);
+  const responseTotal = Number.isFinite(parsedTotal) ? parsedTotal : null;
+  const totalCount = responseTotal === null ? items.length : responseTotal;
   const total = document.createElement('span');
   total.className = 'backlog-pill';
-  total.textContent = `${items.length} items`;
+  total.textContent = responseTotal === null || responseTotal === items.length
+    ? `${items.length} items`
+    : `${items.length} of ${responseTotal} items`;
   nodes.push(total);
+
+  const mode = document.createElement('span');
+  mode.className = 'backlog-pill';
+  mode.textContent = showAllBacklog ? 'all items' : 'active only';
+  nodes.push(mode);
+
+  const hiddenCount = totalCount - items.length;
+  if (!showAllBacklog && hiddenCount > 0) {
+    const hidden = document.createElement('span');
+    hidden.className = 'backlog-pill';
+    hidden.textContent = `${hiddenCount} inactive hidden`;
+    nodes.push(hidden);
+  }
   for (const [status, count] of backlogStatusCounts(items)) {
     const pill = document.createElement('span');
     pill.className = 'backlog-pill';
@@ -1716,12 +1751,23 @@ function renderBacklogSummary(data) {
   summary.replaceChildren(...nodes);
 }
 
+function toggleBacklogAll() {
+  showAllBacklog = !showAllBacklog;
+  pollBacklog({force: true});
+}
+
+function isActiveBacklogItem(item) {
+  const status = String(item.status || '').toLowerCase();
+  return status === 'doing' || status === 'todo';
+}
+
 function backlogPriorityRank(item) {
   const status = String(item.status || '').toLowerCase();
-  if (status === 'open') return 0;
-  if (status === 'parked') return 1;
-  if (status === 'deferred') return 2;
-  return 3;
+  if (status === 'doing') return 0;
+  if (status === 'todo') return 1;
+  if (!['done', 'dropped', 'promoted', 'absorbed', 'deferred', 'parked'].includes(status)) return 2;
+  if (status === 'parked' || status === 'deferred') return 3;
+  return 4;
 }
 
 function orderBacklogItems(items) {
@@ -1741,6 +1787,24 @@ function backlogGroupTitle(item) {
   if (promotedTo && promotedTo.toLowerCase().includes('spike')) return `Spike ${promotedTo}`;
   if (promotedTo) return `Promoted to ${promotedTo}`;
   return 'No epic or spike';
+}
+
+function buildBacklogGroups(items) {
+  const activeGroupTitles = new Set(
+    items
+      .filter(isActiveBacklogItem)
+      .map(backlogGroupTitle)
+  );
+  const groups = new Map();
+  for (const item of items) {
+    const itemGroupTitle = backlogGroupTitle(item);
+    const title = isActiveBacklogItem(item) || activeGroupTitles.has(itemGroupTitle)
+      ? itemGroupTitle
+      : 'Inactive backlog';
+    if (!groups.has(title)) groups.set(title, []);
+    groups.get(title).push(item);
+  }
+  return groups;
 }
 
 function renderBacklogSectionHeader(title, items) {
@@ -1801,7 +1865,7 @@ function renderBacklogCard(item, isCurrent) {
   if (isCurrent) {
     const current = document.createElement('span');
     current.className = 'backlog-current-label';
-    current.textContent = 'Current open';
+    current.textContent = String(item.status || '').toLowerCase() === 'doing' ? 'Current' : 'Next';
     header.appendChild(current);
   }
 
@@ -1825,19 +1889,16 @@ function renderBacklogItems(items) {
   if (!items.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = 'No backlog items returned by AgentTalk.';
+    empty.textContent = showAllBacklog
+      ? 'No backlog items returned by AgentTalk.'
+      : 'No active backlog items returned by AgentTalk.';
     list.replaceChildren(empty);
     return;
   }
 
   const ordered = orderBacklogItems(items);
-  const currentOpen = ordered.find(item => String(item.status || '').toLowerCase() === 'open');
-  const groups = new Map();
-  for (const item of ordered) {
-    const title = backlogGroupTitle(item);
-    if (!groups.has(title)) groups.set(title, []);
-    groups.get(title).push(item);
-  }
+  const currentActive = ordered.find(isActiveBacklogItem);
+  const groups = buildBacklogGroups(ordered);
 
   const nodes = [];
   for (const [title, groupItems] of groups) {
@@ -1845,7 +1906,7 @@ function renderBacklogItems(items) {
     section.className = 'backlog-section';
     section.appendChild(renderBacklogSectionHeader(title, groupItems));
     for (const item of groupItems) {
-      section.appendChild(renderBacklogCard(item, currentOpen && item.id === currentOpen.id));
+      section.appendChild(renderBacklogCard(item, currentActive && item.id === currentActive.id));
     }
     nodes.push(section);
   }
@@ -1860,17 +1921,17 @@ async function pollBacklog(options = {}) {
   if (refresh) refresh.disabled = true;
   setBacklogStatus('Loading...', '');
   try {
-    const r = await fetch('/api/agenttalk/backlog');
+    const r = await fetch(showAllBacklog ? '/api/agenttalk/backlog?all=true' : '/api/agenttalk/backlog');
     const data = await r.json().catch(() => ({}));
     setBacklogSource(data.agenttalk_url);
     if (!r.ok || !data.ok) {
       throw new Error(data.error || `Backlog failed: ${r.status}`);
     }
-    renderBacklogSummary(data);
-    renderBacklogItems(Array.isArray(data.items) ? data.items : []);
+    renderBacklog(data);
     backlogLoaded = true;
     setBacklogStatus('Loaded', 'ok');
   } catch (e) {
+    updateBacklogAllToggle();
     document.getElementById('backlog-summary').replaceChildren();
     const list = document.getElementById('backlog-list');
     const error = document.createElement('div');
