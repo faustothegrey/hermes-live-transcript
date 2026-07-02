@@ -1305,13 +1305,41 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   }
   .backlog-list {
     display: grid;
+    gap: 16px;
+  }
+  .backlog-section {
+    display: grid;
     gap: 8px;
+  }
+  .backlog-section-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+  .backlog-section-title {
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .backlog-section-count {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 7px;
+    background: var(--card);
   }
   .backlog-item {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 14px;
+  }
+  .backlog-item.current {
+    border-color: #f2cc60;
+    box-shadow: inset 3px 0 0 #f2cc60;
   }
   .backlog-item-header {
     display: flex;
@@ -1327,6 +1355,12 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   .backlog-meta {
     color: var(--muted);
     font-size: 12px;
+  }
+  .backlog-current-label {
+    color: #f2cc60;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
   }
   .backlog-tags {
     display: flex;
@@ -1345,6 +1379,16 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     color: var(--text);
     font-size: 13px;
     line-height: 1.45;
+  }
+  .backlog-body summary {
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 12px;
+    margin: 4px 0;
+    user-select: none;
+  }
+  .backlog-body-content {
+    margin-top: 6px;
     white-space: pre-wrap;
   }
   #transcript {
@@ -1672,6 +1716,110 @@ function renderBacklogSummary(data) {
   summary.replaceChildren(...nodes);
 }
 
+function backlogPriorityRank(item) {
+  const status = String(item.status || '').toLowerCase();
+  if (status === 'open') return 0;
+  if (status === 'parked') return 1;
+  if (status === 'deferred') return 2;
+  return 3;
+}
+
+function orderBacklogItems(items) {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => {
+      const byRank = backlogPriorityRank(a.item) - backlogPriorityRank(b.item);
+      return byRank || a.index - b.index;
+    })
+    .map(({ item }) => item);
+}
+
+function backlogGroupTitle(item) {
+  const epic = String(item.epic || '').trim();
+  const promotedTo = String(item.promotedTo || '').trim();
+  if (epic) return `Epic ${epic}`;
+  if (promotedTo && promotedTo.toLowerCase().includes('spike')) return `Spike ${promotedTo}`;
+  if (promotedTo) return `Promoted to ${promotedTo}`;
+  return 'No epic or spike';
+}
+
+function renderBacklogSectionHeader(title, items) {
+  const header = document.createElement('div');
+  header.className = 'backlog-section-header';
+
+  const name = document.createElement('span');
+  name.className = 'backlog-section-title';
+  name.textContent = title;
+  header.appendChild(name);
+
+  const total = document.createElement('span');
+  total.className = 'backlog-section-count';
+  total.textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+  header.appendChild(total);
+
+  for (const [status, count] of backlogStatusCounts(items)) {
+    const statusEl = document.createElement('span');
+    statusEl.className = 'backlog-section-count';
+    statusEl.textContent = `${status}: ${count}`;
+    header.appendChild(statusEl);
+  }
+
+  return header;
+}
+
+function renderBacklogDescription(item, isCurrent) {
+  const body = document.createElement('details');
+  body.className = 'backlog-body';
+  const text = item.bodyMarkdown || '';
+  body.open = isCurrent || text.length <= 700;
+
+  const summary = document.createElement('summary');
+  summary.textContent = body.open ? 'Description' : `Description (${text.length.toLocaleString()} chars)`;
+
+  const content = document.createElement('div');
+  content.className = 'backlog-body-content';
+  content.textContent = text;
+
+  body.append(summary, content);
+  return body;
+}
+
+function renderBacklogCard(item, isCurrent) {
+  const card = document.createElement('article');
+  card.className = isCurrent ? 'backlog-item current' : 'backlog-item';
+
+  const header = document.createElement('div');
+  header.className = 'backlog-item-header';
+  const title = document.createElement('span');
+  title.className = 'backlog-title';
+  title.textContent = item.title || '(untitled)';
+  const meta = document.createElement('span');
+  meta.className = 'backlog-meta';
+  const metaParts = [item.id, item.status, item.epic, item.date].filter(Boolean);
+  meta.textContent = metaParts.join(' / ');
+  header.append(title, meta);
+  if (isCurrent) {
+    const current = document.createElement('span');
+    current.className = 'backlog-current-label';
+    current.textContent = 'Current open';
+    header.appendChild(current);
+  }
+
+  card.append(header, renderBacklogDescription(item, isCurrent));
+  if (Array.isArray(item.tags) && item.tags.length > 0) {
+    const tags = document.createElement('div');
+    tags.className = 'backlog-tags';
+    for (const tag of item.tags) {
+      const tagEl = document.createElement('span');
+      tagEl.className = 'backlog-tag';
+      tagEl.textContent = tag;
+      tags.appendChild(tagEl);
+    }
+    card.appendChild(tags);
+  }
+  return card;
+}
+
 function renderBacklogItems(items) {
   const list = document.getElementById('backlog-list');
   if (!items.length) {
@@ -1682,39 +1830,25 @@ function renderBacklogItems(items) {
     return;
   }
 
-  const nodes = items.map(item => {
-    const card = document.createElement('article');
-    card.className = 'backlog-item';
+  const ordered = orderBacklogItems(items);
+  const currentOpen = ordered.find(item => String(item.status || '').toLowerCase() === 'open');
+  const groups = new Map();
+  for (const item of ordered) {
+    const title = backlogGroupTitle(item);
+    if (!groups.has(title)) groups.set(title, []);
+    groups.get(title).push(item);
+  }
 
-    const header = document.createElement('div');
-    header.className = 'backlog-item-header';
-    const title = document.createElement('span');
-    title.className = 'backlog-title';
-    title.textContent = item.title || '(untitled)';
-    const meta = document.createElement('span');
-    meta.className = 'backlog-meta';
-    const metaParts = [item.id, item.status, item.epic, item.date].filter(Boolean);
-    meta.textContent = metaParts.join(' / ');
-    header.append(title, meta);
-
-    const body = document.createElement('div');
-    body.className = 'backlog-body';
-    body.textContent = item.bodyMarkdown || '';
-
-    card.append(header, body);
-    if (Array.isArray(item.tags) && item.tags.length > 0) {
-      const tags = document.createElement('div');
-      tags.className = 'backlog-tags';
-      for (const tag of item.tags) {
-        const tagEl = document.createElement('span');
-        tagEl.className = 'backlog-tag';
-        tagEl.textContent = tag;
-        tags.appendChild(tagEl);
-      }
-      card.appendChild(tags);
+  const nodes = [];
+  for (const [title, groupItems] of groups) {
+    const section = document.createElement('section');
+    section.className = 'backlog-section';
+    section.appendChild(renderBacklogSectionHeader(title, groupItems));
+    for (const item of groupItems) {
+      section.appendChild(renderBacklogCard(item, currentOpen && item.id === currentOpen.id));
     }
-    return card;
-  });
+    nodes.push(section);
+  }
   list.replaceChildren(...nodes);
 }
 

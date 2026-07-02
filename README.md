@@ -299,7 +299,7 @@ Errore quando AgentTalk non e disponibile:
 - Pulsante **Auto-scroll** per saltare in cima quando arrivano nuovi messaggi
 - Pulsante **Clear** che svuota solo il DOM locale; non cancella dati dai DB
 - Pulsante **Archive** che chiede un nome file e salva i messaggi attualmente visibili in `~/.hermes/live-transcript-archives/`
-- Tab **Backlog** che legge il backlog corrente da AgentTalk, mostra l'endpoint API configurato, conteggi per stato, warnings e item, e si aggiorna ogni 30s quando e attiva
+- Tab **Backlog** che legge il backlog corrente da AgentTalk, mostra l'endpoint API configurato, conteggi per stato, warnings e item raggruppati per epic/spike, e si aggiorna ogni 30s quando e attiva. Le descrizioni sono espandibili; la UI ordina gli item `open` prima degli altri e evidenzia il primo `open` come corrente.
 - Sidebar **Send to Hermes** con **Send** o `Cmd/Ctrl+Enter` per inviare il testo cosi com'e; **Start** sta a destra di Send, aggiunge i metadati del progetto al messaggio, ed e disabilitato dopo l'avvio della sessione
 - Messaggio pending locale dopo l'invio, rimosso quando il corrispondente messaggio `human` compare in `state.db`
 - Badge agenti con pallino verde/rosso; hover sui badge con sessione tmux per mostrare il comando, click per copiarlo
