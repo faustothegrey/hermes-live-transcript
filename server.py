@@ -1277,6 +1277,18 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   }
   #backlog-status.error { color: #ff7b72; }
   #backlog-status.ok { color: #3fb950; }
+  .backlog-source {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 12px;
+  }
+  .backlog-source code {
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 5px;
+  }
   .backlog-summary {
     display: flex;
     flex-wrap: wrap;
@@ -1532,6 +1544,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         <button id="btn-backlog-refresh" onclick="pollBacklog({force: true})">Refresh</button>
         <span id="backlog-status">Not loaded</span>
       </div>
+      <div class="backlog-source">AgentTalk API: <code id="backlog-source">loading...</code></div>
       <div id="backlog-summary" class="backlog-summary"></div>
       <div id="backlog-list" class="backlog-list">
         <div class="empty">Open the Backlog tab to load AgentTalk backlog items.</div>
@@ -1614,6 +1627,11 @@ function setBacklogStatus(text, state) {
   const el = document.getElementById('backlog-status');
   el.textContent = text;
   el.className = state || '';
+}
+
+function setBacklogSource(url) {
+  const el = document.getElementById('backlog-source');
+  if (el) el.textContent = url || 'AgentTalk';
 }
 
 function backlogStatusCounts(items) {
@@ -1710,13 +1728,14 @@ async function pollBacklog(options = {}) {
   try {
     const r = await fetch('/api/agenttalk/backlog');
     const data = await r.json().catch(() => ({}));
+    setBacklogSource(data.agenttalk_url);
     if (!r.ok || !data.ok) {
       throw new Error(data.error || `Backlog failed: ${r.status}`);
     }
     renderBacklogSummary(data);
     renderBacklogItems(Array.isArray(data.items) ? data.items : []);
     backlogLoaded = true;
-    setBacklogStatus(`Loaded from ${data.agenttalk_url || 'AgentTalk'}`, 'ok');
+    setBacklogStatus('Loaded', 'ok');
   } catch (e) {
     document.getElementById('backlog-summary').replaceChildren();
     const list = document.getElementById('backlog-list');
