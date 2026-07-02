@@ -32,6 +32,7 @@ HERMES_API_BASE_URL = os.getenv("HERMES_API_BASE_URL", "http://127.0.0.1:8642")
 HERMES_API_KEY_FILE = Path.home() / ".hermes" / "live-transcript-api-key"
 HERMES_CONFIG_FILE = Path.home() / ".hermes" / "config.yaml"
 HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
+AGENTTALK_API_BASE_URL = os.getenv("AGENTTALK_API_BASE_URL", "http://127.0.0.1:3000")
 PROJECT_PATH = Path(os.getenv("HERMES_LIVE_PROJECT_PATH") or os.getenv("HERMES_PROJECT_PATH") or Path.cwd()).expanduser().resolve()
 PROJECT_NAME = (
     os.getenv("HERMES_LIVE_PROJECT_NAME")
@@ -794,6 +795,8 @@ class TranscriptHandler(BaseHTTPRequestHandler):
             self._serve_current()
         elif path == "/api/bus/status":
             self._serve_bus_status()
+        elif path == "/api/agenttalk/backlog":
+            self._serve_agenttalk_backlog()
         else:
             self._json(404, json.dumps({"error": "not found"}).encode("utf-8"))
 
@@ -811,7 +814,7 @@ class TranscriptHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if path in ("/", "/api/status", "/api/current", "/api/bus/status", "/api/archive"):
+        if path in ("/", "/api/status", "/api/current", "/api/bus/status", "/api/archive", "/api/agenttalk/backlog"):
             self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -1059,6 +1062,40 @@ class TranscriptHandler(BaseHTTPRequestHandler):
         body = json.dumps({"agents": agents}).encode("utf-8")
         self._json(200, body)
 
+    def _serve_agenttalk_backlog(self):
+        url = f"{AGENTTALK_API_BASE_URL.rstrip('/')}/api/backlog"
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                raw = r.read()
+            data = json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            self._json(
+                exc.code,
+                json.dumps({
+                    "ok": False,
+                    "error": "AgentTalk backlog API returned an error",
+                    "detail": detail,
+                    "agenttalk_url": url,
+                }).encode("utf-8"),
+            )
+            return
+        except Exception as exc:
+            self._json(
+                502,
+                json.dumps({
+                    "ok": False,
+                    "error": "AgentTalk backlog API unavailable",
+                    "detail": str(exc),
+                    "agenttalk_url": url,
+                }).encode("utf-8"),
+            )
+            return
+
+        body = json.dumps({"ok": True, "agenttalk_url": url, **data}, ensure_ascii=False).encode("utf-8")
+        self._json(200, body)
+
     def _serve_html(self):
         html = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1129,6 +1166,27 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   }
   .controls button:hover { background: #21262d; }
   .controls button.active { border-color: var(--hermes); }
+  .view-tabs {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .view-tabs button {
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .view-tabs button.active {
+    border-bottom-color: var(--hermes);
+    color: var(--text);
+  }
+  .view { display: none; }
+  .view.active { display: block; }
   .layout {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 320px;
@@ -1212,6 +1270,71 @@ class TranscriptHandler(BaseHTTPRequestHandler):
   }
   #archive-status.ok { color: #3fb950; }
   #archive-status.error { color: #ff7b72; }
+  #backlog-status {
+    color: var(--muted);
+    font-size: 12px;
+    align-self: center;
+  }
+  #backlog-status.error { color: #ff7b72; }
+  #backlog-status.ok { color: #3fb950; }
+  .backlog-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .backlog-pill {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 8px;
+    background: var(--card);
+  }
+  .backlog-list {
+    display: grid;
+    gap: 8px;
+  }
+  .backlog-item {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .backlog-item-header {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+  .backlog-title {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .backlog-meta {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .backlog-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+  }
+  .backlog-tag {
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 11px;
+  }
+  .backlog-body {
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
   #transcript {
     display: flex;
     flex-direction: column-reverse;
@@ -1385,16 +1508,34 @@ class TranscriptHandler(BaseHTTPRequestHandler):
 
 <div class="layout">
   <main class="main-pane">
-    <div class="controls">
-      <button id="btn-scroll" class="active" onclick="toggleScroll()">Auto-scroll</button>
-      <button onclick="clearTranscript()">Clear</button>
-      <button id="btn-archive" onclick="archiveTranscript()">Archive</button>
-      <span id="archive-status"></span>
-      <span id="msg-count">0 messages</span>
+    <div class="view-tabs">
+      <button id="tab-transcript" class="active" onclick="showView('transcript')">Transcript</button>
+      <button id="tab-backlog" onclick="showView('backlog')">Backlog</button>
     </div>
 
-    <div id="transcript">
-      <div class="empty">Waiting for messages...</div>
+    <div id="view-transcript" class="view active">
+      <div class="controls">
+        <button id="btn-scroll" class="active" onclick="toggleScroll()">Auto-scroll</button>
+        <button onclick="clearTranscript()">Clear</button>
+        <button id="btn-archive" onclick="archiveTranscript()">Archive</button>
+        <span id="archive-status"></span>
+        <span id="msg-count">0 messages</span>
+      </div>
+
+      <div id="transcript">
+        <div class="empty">Waiting for messages...</div>
+      </div>
+    </div>
+
+    <div id="view-backlog" class="view">
+      <div class="controls">
+        <button id="btn-backlog-refresh" onclick="pollBacklog({force: true})">Refresh</button>
+        <span id="backlog-status">Not loaded</span>
+      </div>
+      <div id="backlog-summary" class="backlog-summary"></div>
+      <div id="backlog-list" class="backlog-list">
+        <div class="empty">Open the Backlog tab to load AgentTalk backlog items.</div>
+      </div>
     </div>
   </main>
 
@@ -1418,6 +1559,9 @@ let polling = false;
 let initialized = false;
 let currentSessionTitle = null;
 let sending = false;
+let activeView = 'transcript';
+let backlogLoaded = false;
+let backlogPolling = false;
 const PROJECT_NAME = __PROJECT_NAME_JSON__;
 const PROJECT_PATH = __PROJECT_PATH_JSON__;
 const LINCHPIN_DOCS = __LINCHPIN_DOCS_JSON__;
@@ -1455,6 +1599,136 @@ function updateSendButtons() {
   if (!sendButton || !startButton) return;
   sendButton.disabled = sending;
   startButton.disabled = sending || Boolean(sessionId);
+}
+
+function showView(name) {
+  activeView = name;
+  document.getElementById('tab-transcript').className = name === 'transcript' ? 'active' : '';
+  document.getElementById('tab-backlog').className = name === 'backlog' ? 'active' : '';
+  document.getElementById('view-transcript').className = name === 'transcript' ? 'view active' : 'view';
+  document.getElementById('view-backlog').className = name === 'backlog' ? 'view active' : 'view';
+  if (name === 'backlog') pollBacklog();
+}
+
+function setBacklogStatus(text, state) {
+  const el = document.getElementById('backlog-status');
+  el.textContent = text;
+  el.className = state || '';
+}
+
+function backlogStatusCounts(items) {
+  const counts = new Map();
+  for (const item of items) {
+    const status = String(item.status || 'unknown');
+    counts.set(status, (counts.get(status) || 0) + 1);
+  }
+  return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function renderBacklogSummary(data) {
+  const summary = document.getElementById('backlog-summary');
+  const items = Array.isArray(data.items) ? data.items : [];
+  const nodes = [];
+  const total = document.createElement('span');
+  total.className = 'backlog-pill';
+  total.textContent = `${items.length} items`;
+  nodes.push(total);
+  for (const [status, count] of backlogStatusCounts(items)) {
+    const pill = document.createElement('span');
+    pill.className = 'backlog-pill';
+    pill.textContent = `${status}: ${count}`;
+    nodes.push(pill);
+  }
+  if (data.generatedAt) {
+    const generated = document.createElement('span');
+    generated.className = 'backlog-pill';
+    generated.textContent = `generated ${new Date(data.generatedAt).toLocaleString()}`;
+    nodes.push(generated);
+  }
+  if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+    const warnings = document.createElement('span');
+    warnings.className = 'backlog-pill';
+    warnings.textContent = `${data.warnings.length} warnings`;
+    nodes.push(warnings);
+  }
+  summary.replaceChildren(...nodes);
+}
+
+function renderBacklogItems(items) {
+  const list = document.getElementById('backlog-list');
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No backlog items returned by AgentTalk.';
+    list.replaceChildren(empty);
+    return;
+  }
+
+  const nodes = items.map(item => {
+    const card = document.createElement('article');
+    card.className = 'backlog-item';
+
+    const header = document.createElement('div');
+    header.className = 'backlog-item-header';
+    const title = document.createElement('span');
+    title.className = 'backlog-title';
+    title.textContent = item.title || '(untitled)';
+    const meta = document.createElement('span');
+    meta.className = 'backlog-meta';
+    const metaParts = [item.id, item.status, item.epic, item.date].filter(Boolean);
+    meta.textContent = metaParts.join(' / ');
+    header.append(title, meta);
+
+    const body = document.createElement('div');
+    body.className = 'backlog-body';
+    body.textContent = item.bodyMarkdown || '';
+
+    card.append(header, body);
+    if (Array.isArray(item.tags) && item.tags.length > 0) {
+      const tags = document.createElement('div');
+      tags.className = 'backlog-tags';
+      for (const tag of item.tags) {
+        const tagEl = document.createElement('span');
+        tagEl.className = 'backlog-tag';
+        tagEl.textContent = tag;
+        tags.appendChild(tagEl);
+      }
+      card.appendChild(tags);
+    }
+    return card;
+  });
+  list.replaceChildren(...nodes);
+}
+
+async function pollBacklog(options = {}) {
+  if (backlogPolling) return;
+  if (backlogLoaded && activeView !== 'backlog' && !options.force) return;
+  backlogPolling = true;
+  const refresh = document.getElementById('btn-backlog-refresh');
+  if (refresh) refresh.disabled = true;
+  setBacklogStatus('Loading...', '');
+  try {
+    const r = await fetch('/api/agenttalk/backlog');
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) {
+      throw new Error(data.error || `Backlog failed: ${r.status}`);
+    }
+    renderBacklogSummary(data);
+    renderBacklogItems(Array.isArray(data.items) ? data.items : []);
+    backlogLoaded = true;
+    setBacklogStatus(`Loaded from ${data.agenttalk_url || 'AgentTalk'}`, 'ok');
+  } catch (e) {
+    document.getElementById('backlog-summary').replaceChildren();
+    const list = document.getElementById('backlog-list');
+    const error = document.createElement('div');
+    error.className = 'empty';
+    error.textContent = e.message || 'Backlog unavailable';
+    list.replaceChildren(error);
+    setBacklogStatus(e.message || 'Backlog unavailable', 'error');
+  } finally {
+    backlogPolling = false;
+    if (refresh) refresh.disabled = false;
+  }
 }
 
 function toggleScroll() {
@@ -1946,6 +2220,10 @@ setInterval(poll, __POLL_INTERVAL__);
 updateSendButtons();
 poll();
 
+setInterval(() => {
+  if (activeView === 'backlog') pollBacklog();
+}, 30000);
+
 // Agent liveness bar
 setInterval(pollAgentBar, 5000);
 pollAgentBar();
@@ -2033,6 +2311,7 @@ def main():
     print(f"Hermes Live Transcript: http://127.0.0.1:{PORT}")
     print(f"  Reading from: {STATE_DB}")
     print(f"  Project: {PROJECT_NAME} ({PROJECT_PATH})")
+    print(f"  AgentTalk API: {AGENTTALK_API_BASE_URL}")
     sid = get_current_session_id()
     print(f"  Today session: {sid}")
     print("  Press Ctrl+C to stop.")

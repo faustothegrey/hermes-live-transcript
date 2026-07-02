@@ -20,6 +20,7 @@ Utile per:
 │              Browser (127.0.0.1:8800)              │
 │  GET  /api/current?after=N&bus_after=M&session_id= │
 │  GET  /api/bus/status                              │
+│  GET  /api/agenttalk/backlog                       │
 │  POST /api/send                                    │
 │  POST /api/archive                                 │
 └───────────────────────┬────────────────────────────┘
@@ -32,15 +33,16 @@ Utile per:
 │  GET  /api/current      transcript + bus JSON      │
 │  GET  /api/status       sessione corrente          │
 │  GET  /api/bus/status   liveness agenti            │
+│  GET  /api/agenttalk/   proxy backlog AgentTalk    │
 │  POST /api/send         proxy verso Hermes API     │
 │  POST /api/archive      salva Markdown locale      │
-└───────────────┬───────────────────┬────────────────┘
-                │                   │
-                ▼                   ▼
-┌────────────────────────┐  ┌────────────────────────┐
-│ ~/.hermes/state.db     │  │ ~/.hermes/agent-bus-   │
-│ sessions, messages     │  │ log.db / bus_messages  │
-└────────────────────────┘  └────────────────────────┘
+└───────────────┬───────────────────┬────────────────┬────────────────┘
+                │                   │                │
+                ▼                   ▼                ▼
+┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+│ ~/.hermes/state.db     │  │ ~/.hermes/agent-bus-   │  │ AgentTalk orchestrator │
+│ sessions, messages     │  │ log.db / bus_messages  │  │ /api/backlog           │
+└────────────────────────┘  └────────────────────────┘  └────────────────────────┘
                 │
                 ▼
 ┌────────────────────────────────────────────────────┐
@@ -59,6 +61,7 @@ Utile per:
 | Agent Telemetry | `http://127.0.0.1:9900/agents` | Sorgente di liveness per `/api/bus/status`. Se non risponde, la barra agenti resta vuota. |
 | Hermes API base URL | `HERMES_API_BASE_URL` o `http://127.0.0.1:8642` | Endpoint usato dal proxy `/api/send`. |
 | Progetto corrente | `HERMES_LIVE_PROJECT_NAME`, `HERMES_LIVE_PROJECT_PATH` | Metadati del progetto di sviluppo passati a Hermes quando la UI crea una nuova sessione. Include i linchpin docs `AGENT.md` e `design/collaboration-workflow.md`. |
+| AgentTalk API base URL | `AGENTTALK_API_BASE_URL` o `http://127.0.0.1:3000` | Endpoint usato dal proxy `/api/agenttalk/backlog` per mostrare il backlog nella UI. |
 | API key Hermes | vedi sotto | Letta solo lato server; non viene inserita nell'HTML servito al browser. |
 | LaunchAgent plist | `~/Library/LaunchAgents/com.fausto.hermes-live-transcript.plist` | Configurazione launchd installata. Il file nel repo è la copia sorgente. |
 | Log servizio | `~/.hermes/logs/live-transcript.log` | stdout/stderr del processo launchd. |
@@ -101,6 +104,22 @@ python3 server.py 8800 --dev
 ```
 
 In dev mode la UI polla ogni 1 secondo invece di 3 e stampa un log nel browser: `[Hermes Live] DEV MODE`.
+
+Configurazione progetto/backlog via env:
+
+```bash
+HERMES_LIVE_PROJECT_NAME=AgentTalk \
+HERMES_LIVE_PROJECT_PATH=/Users/fausto/Software/AgentTalk \
+AGENTTALK_API_BASE_URL=http://127.0.0.1:3000 \
+python3 server.py 8800 --dev
+```
+
+Per popolare la tab **Backlog**, il backend AgentTalk deve essere in ascolto e servire `GET /api/backlog`, ad esempio dal repo AgentTalk:
+
+```bash
+cd /Users/fausto/Software/AgentTalk
+npm run backend
+```
 
 ## API
 
@@ -232,6 +251,44 @@ Comportamento:
 - include nell'archivio `session_id`, nome progetto, path progetto, timestamp del primo e ultimo messaggio
 - risponde con path, filename, archive id e numero messaggi salvati
 
+### `GET /api/agenttalk/backlog`
+
+Proxy locale verso `GET {AGENTTALK_API_BASE_URL}/api/backlog`. Restituisce i campi AgentTalk `items`, `warnings` e `generatedAt`, piu `ok` e `agenttalk_url`. Se AgentTalk non e in ascolto, risponde `502` con un errore leggibile dalla tab **Backlog**.
+
+Risposta tipica:
+
+```json
+{
+  "ok": true,
+  "agenttalk_url": "http://127.0.0.1:3000/api/backlog",
+  "generatedAt": "2026-07-01T19:05:00.000Z",
+  "warnings": [],
+  "items": [
+    {
+      "id": "BL-001",
+      "status": "open",
+      "date": "2026-07-01",
+      "epic": "M13",
+      "promotedTo": null,
+      "tags": ["ui", "backlog"],
+      "title": "Example backlog item",
+      "bodyMarkdown": "- [open] **Example backlog item** - details..."
+    }
+  ]
+}
+```
+
+Errore quando AgentTalk non e disponibile:
+
+```json
+{
+  "ok": false,
+  "error": "AgentTalk backlog API unavailable",
+  "detail": "<urlopen error [Errno 61] Connection refused>",
+  "agenttalk_url": "http://127.0.0.1:3000/api/backlog"
+}
+```
+
 ## UI / comportamento
 
 - Poll automatico del transcript: 3s default, 1s con `--dev`
@@ -242,6 +299,7 @@ Comportamento:
 - Pulsante **Auto-scroll** per saltare in cima quando arrivano nuovi messaggi
 - Pulsante **Clear** che svuota solo il DOM locale; non cancella dati dai DB
 - Pulsante **Archive** che chiede un nome file e salva i messaggi attualmente visibili in `~/.hermes/live-transcript-archives/`
+- Tab **Backlog** che legge il backlog corrente da AgentTalk, mostra conteggi per stato, warnings e item, e si aggiorna ogni 30s quando e attiva
 - Sidebar **Send to Hermes** con **Send** o `Cmd/Ctrl+Enter` per inviare il testo cosi com'e; **Start** sta a destra di Send, aggiunge i metadati del progetto al messaggio, ed e disabilitato dopo l'avvio della sessione
 - Messaggio pending locale dopo l'invio, rimosso quando il corrispondente messaggio `human` compare in `state.db`
 - Badge agenti con pallino verde/rosso; hover sui badge con sessione tmux per mostrare il comando, click per copiarlo

@@ -18,6 +18,8 @@
         <string>AgentTalk</string>
         <key>HERMES_LIVE_PROJECT_PATH</key>
         <string>/Users/fausto/Software/AgentTalk</string>
+        <key>AGENTTALK_API_BASE_URL</key>
+        <string>http://127.0.0.1:3000</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>/Users/fausto/Software/scripts-ai/hermes-live-transcript</string>
